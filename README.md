@@ -38,12 +38,15 @@ decoder learned in one animal works in another. The headline figure is the decod
 
 **For a computational analyst.** Continuous variables, per session: features are square-rooted
 spike counts in `DECODE_BIN_S` bins, Gaussian-smoothed (`SMOOTH_S`), with `HISTORY_BINS` bins of
-history (the current and the previous bins of every neuron side by side: BrainWideBench, Andre et al.
-2026, finds a history window the cheapest large gain for wheel decoding), z-scored on the training fold
+history (BrainWideBench, Andre et al. 2026, finds a history window the cheapest large gain for
+wheel decoding); to keep the feature count manageable the lags are grouped on a log scale, as a
+raised-cosine history basis would (10 bins: lag 0, 1, 2-3, 4-7, 8-9, each group averaged, so 5
+features per neuron), z-scored on the training fold
 (SD floored, z clipped at ±10 so that a unit lost or found mid-session cannot blow up a fold);
 `CV_FOLDS` contiguous blocks with `CV_GAP_S` removed from the training set on both sides of each
-test block. Decoders: `RidgeCV` (alpha from a log grid by inner 3-fold blocked CV), `MLPRegressor`
-(64-32, early stopping), and for position variables of spiking data a Poisson naive-Bayes decoder
+test block. Decoders: ridge (alpha from a log grid by inner 3-fold blocked CV; every alpha from one
+eigendecomposition of the Gram matrix), `MLPRegressor` (64-32, L2 penalty 1.0, early stopping,
+predictions clipped to the training range), and for position variables of spiking data a Poisson naive-Bayes decoder
 (occupancy-normalised tuning curves from the training fold, occupancy prior, posterior mean, counts
 in a 0.5 s window). Score: mean of per-fold R² (also Pearson r and median absolute error in the
 variable's unit). Null: `N_SHUFFLES` circular shifts of the behaviour by at least `MIN_SHIFT_S`,
@@ -102,7 +105,8 @@ Without links everything may sit side by side under `INPUT_DIR`; files are found
    `MIN_UNITS_PER_REGION` units; otherwise skipped with the reason logged): each target region's
    units are split at random into halves; the second half is predicted from the first (within
    region) and from each source region subsampled to the same number of units (between regions),
-   on the epoch's bins, with the same blocked folds. Each prediction is a full-rank ridge model and
+   on the epoch's bins, with the same blocked folds, after removing each unit's 60-s running mean
+   (slow drifts; Semedo et al. used trial residuals). Each prediction is a full-rank ridge model and
    its reduced-rank versions (ridge coefficients projected on the top r axes of the fitted
    predictions, r = 1 .. `RRR_MAX_RANK`); the optimal rank is the smallest r within one standard
    error of the full model (Semedo et al. 2019). Plain numpy.

@@ -69,41 +69,65 @@ def _standardise(Xtr, Xte):
     return np.clip((Xtr - mu) / sd, -10, 10), np.clip((Xte - mu) / sd, -10, 10)
 
 
-def ridge_cv(F: np.ndarray, y: np.ndarray, folds, inner: int = 3) -> dict:
-    """Ridge with alpha chosen per outer fold by inner blocked CV; returns predictions per fold."""
-    from sklearn.linear_model import RidgeCV
-    from sklearn.model_selection import KFold
+def _svd(a):
+    """Eigen-decomposition of the Gram matrix a'a (d x d): ridge for every alpha from one
+    decomposition, and cheaper than an SVD of the n x d design when n >> d."""
+    lam, V = np.linalg.eigh(a.T @ a)
+    return a, np.maximum(lam, 0.0), V
 
+
+def _ridge_preds(dec, y, b, alphas) -> np.ndarray:
+    """Predictions on b for every alpha: coef = V diag(1 / (lam + alpha)) V' a' (y - mean)."""
+    a, lam, V = dec
+    mu = y.mean()
+    z = V.T @ (a.T @ (y - mu))
+    W = 1.0 / (lam[None, :] + np.asarray(alphas)[:, None])               # alphas x d
+    coefs = (W * z[None, :]) @ V.T                                        # alphas x d
+    return b @ coefs.T + mu                                               # n_test x alphas
+
+
+def _inner_alpha(a, y, inner: int) -> float:
+    blocks = np.array_split(np.arange(len(y)), inner)
+    scores = np.zeros(len(ALPHAS))
+    for blk in blocks:
+        tr = np.setdiff1d(np.arange(len(y)), blk)
+        P = _ridge_preds(_svd(a[tr]), y[tr], a[blk], ALPHAS)
+        scores += np.array([r2(y[blk], P[:, i]) for i in range(len(ALPHAS))])
+    return float(ALPHAS[int(np.nanargmax(scores))])
+
+
+def ridge_cv(F: np.ndarray, y: np.ndarray, folds, inner: int = 3) -> dict:
+    """Ridge with alpha chosen per outer fold by inner blocked CV (contiguous blocks of the training
+    data); one SVD per fit evaluates every alpha. Returns predictions per fold."""
     preds, trues, alphas = [], [], []
     for tr, te in folds:
         a, b = _standardise(F[tr], F[te])
-        m = RidgeCV(alphas=ALPHAS, cv=KFold(inner, shuffle=False)).fit(a, y[tr])
-        preds.append(m.predict(b))
+        alpha = _inner_alpha(a, y[tr], inner)
+        preds.append(_ridge_preds(_svd(a), y[tr], b, [alpha])[:, 0])
         trues.append(y[te])
-        alphas.append(float(m.alpha_))
+        alphas.append(alpha)
     out = summarize_continuous(trues, preds)
     out.update(pred_folds=preds, alpha=float(np.median(alphas)))
     return out
 
 
 class FastRidge:
-    """Ridge with a fixed alpha on fixed folds, solved once per fold, so that many targets (the
-    circularly shifted nulls) cost one matrix product each."""
+    """Ridge with a fixed alpha on fixed folds, decomposed once per fold, so that many targets (the
+    circularly shifted nulls) cost two matrix-vector products each."""
 
     def __init__(self, F: np.ndarray, folds, alpha: float):
         self.folds = folds
         self.mats = []
         for tr, te in folds:
             a, b = _standardise(F[tr], F[te])
-            d = a.shape[1]
-            P = np.linalg.solve(a.T @ a + alpha * np.eye(d), a.T)   # d x n_train
-            self.mats.append((P, b))
+            _, lam, V = _svd(a)
+            self.mats.append(((a @ V).T, (b @ V) / (lam + alpha)[None, :]))
 
     def score(self, y: np.ndarray) -> float:
         s = []
-        for (tr, te), (P, b) in zip(self.folds, self.mats):
+        for (tr, te), (AVt, B) in zip(self.folds, self.mats):
             mu = y[tr].mean()
-            s.append(r2(y[te], b @ (P @ (y[tr] - mu)) + mu))
+            s.append(r2(y[te], B @ (AVt @ (y[tr] - mu)) + mu))
         return float(np.nanmean(s))
 
 
@@ -129,10 +153,11 @@ def mlp_cv(F, y, folds, seed: int) -> dict:
     for tr, te in folds:
         a, b = _standardise(F[tr], F[te])
         mu, sd = y[tr].mean(), y[tr].std() or 1.0
-        m = MLPRegressor(hidden_layer_sizes=(64, 32), alpha=1e-3, learning_rate_init=1e-3, max_iter=300,
+        m = MLPRegressor(hidden_layer_sizes=(64, 32), alpha=1.0, learning_rate_init=1e-3, max_iter=300,
                          early_stopping=True, validation_fraction=0.15, n_iter_no_change=15, random_state=seed)
         m.fit(a, (y[tr] - mu) / sd)
-        preds.append(m.predict(b) * sd + mu)
+        # a network extrapolates wildly on activity unlike the training blocks: clip to the training range
+        preds.append(np.clip(m.predict(b) * sd + mu, y[tr].min(), y[tr].max()))
         trues.append(y[te])
     out = summarize_continuous(trues, preds)
     out["pred_folds"] = preds

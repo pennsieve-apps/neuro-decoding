@@ -25,12 +25,14 @@ application:
     - population-dynamics
     - machine-learning
 runtime:
-  # Measured (linux/amd64 under emulation on an M-series Mac): see README "Runtime".
+  # Measured (linux/amd64 under emulation on an M-series Mac, 2 CPUs): see README "Runtime". Peak memory
+  # stays well under 4 GB; wall time on an IBL session exceeds Lambda's 15 minutes, so the timeout is an
+  # hour (a small session with few variables or N_SHUFFLES lowered fits Lambda).
   cpu: 2048
   memory: 4096
   computeTypes:
     - standard
-  timeoutSeconds: 7200
+  timeoutSeconds: 3600
 parameters:
   - name: VARIABLES
     type: string

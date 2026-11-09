@@ -53,6 +53,7 @@ PARAMETERS = tuple(DEFAULTS)
 CSV_COLUMNS = ["session_id", "subject_id", "condition", "group", "variable", "kind", "unit", "decoder", "features",
                "region", "n_neurons", "n_samples", "cv", "metric", "score", "score_sd", "r", "median_abs_error",
                "chance", "null", "score_corrected", "null_mean", "null_sd", "null_p95", "p_value", "z", "n_shuffles"]
+RRR_DETREND_S = 60.0   # communication subspaces: running mean removed before the regression
 BAYES_WINDOW_S = 0.5   # spike counts of the Bayesian decoder are summed over this centred window
 CITATIONS = ["10.1523/ENEURO.0506-19.2020", "10.1038/s41586-023-06031-6"]
 
@@ -142,19 +143,35 @@ def direction_of(y, dt):
     return np.where(v > thr, 1, np.where(v < -thr, -1, 0))
 
 
+def lag_groups(H: int) -> list[list[int]]:
+    """History lags 0..H-1 grouped on a log scale: [0], [1], [2, 3], [4..7], [8..15], ... (the last group
+    cut at H-1). Recent bins keep their own weight, older ones are averaged, which keeps the number
+    of features (neurons x groups) small, like a raised-cosine history basis."""
+    groups, lo = [], 0
+    while lo < H:
+        hi = max(lo + 1, 2 * lo) if lo else 1
+        groups.append(list(range(lo, min(hi, H))))
+        lo = hi
+    return groups
+
+
 def lagged(F, H: int):
-    """[F(t), F(t-1), ..., F(t-H+1)] side by side (past bins; the first bins repeat the first row)."""
+    """For every history group, the mean of F over its lags (past bins; the first bins repeat row 0)."""
     import numpy as np
 
     F = F.astype(np.float32)
     if H <= 1:
         return F
-    out = np.empty((F.shape[0], F.shape[1] * H), np.float32)
+    groups = lag_groups(H)
+    out = np.empty((F.shape[0], F.shape[1] * len(groups)), np.float32)
+    shifted = {}
     for lag in range(H):
         sh = np.empty_like(F)
         sh[lag:] = F[: F.shape[0] - lag] if lag else F
         sh[:lag] = F[0]
-        out[:, lag * F.shape[1]:(lag + 1) * F.shape[1]] = sh
+        shifted[lag] = sh
+    for g, lags in enumerate(groups):
+        out[:, g * F.shape[1]:(g + 1) * F.shape[1]] = np.mean([shifted[l] for l in lags], axis=0)
     return out
 
 
@@ -188,9 +205,11 @@ def run_session(s, p, emb_path, out_dir: Path, A, D, F, hb):
     Fall = lagged(Fbase, H)
     n_neu = Fbase.shape[1]
 
-    def lag_cols(neurons):   # the lagged columns of a set of neurons
+    n_groups = len(lag_groups(H)) if H > 1 else 1
+
+    def lag_cols(neurons):   # the history columns of a set of neurons
         neurons = np.asarray(neurons)
-        return np.concatenate([lag * n_neu + neurons for lag in range(H)])
+        return np.concatenate([g * n_neu + neurons for g in range(n_groups)])
     ep = s.epoch_mask
 
     def row(var, kind, unit, decoder, region, n_neu, n_samp, cv, metric, res_, chance=None, null=None, nst=None,
@@ -324,7 +343,12 @@ def run_session(s, p, emb_path, out_dir: Path, A, D, F, hb):
         else:
             t0 = time.monotonic()
             ep_idx = np.flatnonzero(ep)
-            Fr = Fbase[ep_idx]
+            # slow drifts (arousal, units lost or found) are removed first, as Semedo et al. used
+            # trial residuals: the activity minus its running mean over RRR_DETREND_S
+            from scipy.ndimage import uniform_filter1d
+
+            w = max(1, int(round(RRR_DETREND_S / dt)))
+            Fr = (Fbase - uniform_filter1d(Fbase, w, axis=0, mode="nearest"))[ep_idx]
             folds_r = D.blocked_folds(s.t[ep_idx], p["CV_FOLDS"], p["CV_GAP_S"])
             rr_rows = R.communication(Fr, rrr_regions, folds_r, np.random.default_rng(p["SEED"]), p["RRR_MAX_RANK"])
             for r in rr_rows:
