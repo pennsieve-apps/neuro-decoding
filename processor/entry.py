@@ -9,7 +9,14 @@ import os
 import sys
 import tempfile
 
-_tmp = tempfile.gettempdir()   # $TMPDIR when set
+for _var in ("TMPDIR", "HOME"):   # the runtime may name folders that do not exist yet: create them
+    if os.environ.get(_var):
+        try:
+            os.makedirs(os.environ[_var], exist_ok=True)
+        except OSError:
+            pass
+tempfile.tempdir = None
+_tmp = tempfile.gettempdir()   # $TMPDIR when set (and writable)
 for _var, _sub in (("MPLCONFIGDIR", "mpl"), ("NUMBA_CACHE_DIR", "numba"), ("XDG_CACHE_HOME", "cache"),
                    ("TORCH_HOME", "torch")):
     if not os.environ.get(_var):
