@@ -291,12 +291,13 @@ def run_session(s, p, emb_path, out_dir: Path, A, D, F, hb):
         # trace window: start of the middle fold
         tr_f = folds[len(folds) // 2][1]
         tt = tv[tr_f]
-        w = tt - tt[0] <= p["TRACE_WINDOW_S"]
+        w = np.arange(tt.size) < max(10, int(round(p["TRACE_WINDOW_S"] / dt)))   # TRACE_WINDOW_S of epoch time
         pl = [("ridge", preds["ridge"]["pred_folds"][len(folds) // 2][w], rd["score"])]
         best = max((k for k in preds if k != "ridge"), key=lambda k: preds[k]["score"], default=None)
         if best:
             pl.append((best.replace("_", " "), preds[best]["pred_folds"][len(folds) // 2][w], preds[best]["score"]))
-        trace_panels.append({"name": var, "unit": unit, "t": tt[w], "true": y[tr_f][w], "preds": pl})
+        trace_panels.append({"name": var, "unit": unit, "t": tt[w], "true": y[tr_f][w], "preds": pl, "dt": dt,
+                             "score": rd["score"], "position": A.is_position(var, s.variables.get(var))})
         decodable = (nst["p_value"] is not None and nst["p_value"] < 0.05) if p["N_SHUFFLES"] else rd["score"] > 0.1
         if decodable:   # held-out-session decoding only for variables this session decodes
             heldout_data[var] = (Fbase[idx], y, direction_of(y, dt) if A.is_position(var, s.variables.get(var)) else None)
@@ -415,7 +416,9 @@ def run_session(s, p, emb_path, out_dir: Path, A, D, F, hb):
     d = out_dir / sid
     d.mkdir(parents=True, exist_ok=True)
     if trace_panels:
-        cont = [x for x in trace_panels if not x.get("categorical")][:4]
+        # at most three continuous panels: a 1-D position first, then the best decoded variables
+        cont = sorted([x for x in trace_panels if not x.get("categorical")],
+                      key=lambda x: (not (x["position"] and x["name"] == "position"), -x["score"]))[:3]
         cat = [x for x in trace_panels if x.get("categorical")][:2]
         figs.append({"path": F.traces(sid, cont + cat, d / f"{sid}_decoded_traces.png"), "caption": trace_caption(sid, res)})
     if nulls:

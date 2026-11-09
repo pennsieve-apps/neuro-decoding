@@ -45,11 +45,26 @@ def traces(sid: str, panels: list[dict], out: Path) -> Path:
             ax.set_title(f"{p['name']}: balanced accuracy {p['score']:.2f} (chance {p['chance']:.2f})", fontsize=9,
                          loc="left")
         else:
-            ax.plot(p["t"], p["true"], color=INK, lw=2, label="true")
+            # epoch time: consecutive analysed bins side by side; a gap in the session (bins outside the
+            # epoch, e.g. immobility) is a thin vertical line and breaks the traces
+            t = np.asarray(p["t"])
+            dt = p.get("dt") or (np.median(np.diff(t)) if t.size > 1 else 1.0)
+            x = np.arange(t.size) * dt
+            gaps = np.flatnonzero(np.diff(t) > 2.5 * dt)
+
+            def broken(v):
+                v = np.asarray(v, float).copy()
+                xs = x.copy()
+                return np.insert(xs, gaps + 1, np.nan), np.insert(v, gaps + 1, np.nan)
+
+            ax.plot(*broken(p["true"]), color=INK, lw=2, label="true")
             for k, (lab, v, sc) in enumerate(p["preds"]):
-                ax.plot(p["t"], v, color=SERIES[k], lw=1.4, alpha=0.9, label=f"{lab} (R² {sc:.2f})")
+                ax.plot(*broken(v), color=SERIES[k], lw=1.4, alpha=0.9, label=f"{lab} (R² {sc:.2f})")
+            for g in gaps:
+                ax.axvline(x[g] + dt / 2, color=GRID, lw=0.8)
             ax.set_ylabel(f"{p['name']}" + (f" ({p['unit']})" if p.get("unit") else ""))
-            ax.set_xlabel("time (s, session clock)")
+            ax.set_xlabel(f"time in the analysed epoch (s; from {t[0]:.0f} s on the session clock"
+                          + (", grey lines: gaps" if gaps.size else "") + ")")
         ax.legend(frameon=False, fontsize=7, ncol=4, loc="lower right", bbox_to_anchor=(1.0, 1.0))
     fig.suptitle(f"{sid}: decoded vs true behaviour on held-out data", fontsize=11)
     fig.tight_layout()
