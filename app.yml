@@ -70,7 +70,8 @@ parameters:
     type: integer
     description: >-
       Bins of history in the ridge and MLP features: the current bin and the HISTORY_BINS - 1
-      before it of every neuron, side by side (10 = 1 s at 0.1 s bins).
+      before it, grouped on a log scale and averaged per group (lags 0, 1, 2-3, 4-7, 8-...), so
+      10 bins = 1 s at 0.1 s bins = 5 features per neuron.
     defaultValue: 10
     min: 1
     max: 100

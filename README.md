@@ -177,7 +177,7 @@ brief's Lambda recipe: read-only root, arbitrary user, only `/tmp` writable) on 
 
 | Session | Analyses | Wall time | Peak memory (cgroup) |
 |---|---|---|---|
-| Grosmark `sub-Buddy` (58 units, run epoch 8,523 bins → 2,131 bins of 0.1 s; 6 continuous variables + lap direction; embedding linked) | ridge, MLP, Bayes, kNN on CEBRA, nulls, dropping | 94 s | 670 MB |
+| Grosmark `sub-Buddy` (58 units, run epoch 10,654 bins of 25 ms → 2,698 bins of 0.1 s; 6 continuous variables + lap direction; embedding linked) | ridge, MLP, Bayes, kNN on CEBRA, nulls, dropping | 94 s | 670 MB |
 | IBL `sub-NR-0031` (186 units, 13 regions, 80,064 → 20,016 bins; 6 continuous + 7 trial variables) | everything, incl. 4 regions and communication subspaces | 2,104 s (continuous variables ~5 min each; trial variables ~30 s each; RRR 29 s) | 1,311 MB |
 | Synthetic fixture (3 sessions) | everything | 120-210 s | 0.5 GB |
 
@@ -192,7 +192,7 @@ the step fits Lambda's 15 minutes; a large IBL session with every pose variable 
 
 - **Grosmark & Buzsáki, rat Buddy** (58 CA1 units, running epoch): 1-D track position decoded with
   R² **0.70** (ridge, 1 s of history; null 95th percentile -0.10, p = 0.005 with 200 circular
-  shifts), **0.80** (MLP) and **0.72** (Bayesian decoder; median error **7.7 cm** along a path of about 2 m); kNN on the CEBRA-Behavior embedding (held-out bins) 0.53, on CEBRA-Time 0.44.
+  shifts), **0.80** (MLP) and **0.72** (Bayesian decoder; median error **7.7 cm**; the source file's position variable spans about 2.5 m for the 1.6 m track, so errors are in its units); kNN on the CEBRA-Behavior embedding (held-out bins) 0.53, on CEBRA-Time 0.44.
   Running speed R² 0.45-0.47; lap direction (out / in) balanced accuracy **0.89** (chance 0.5,
   null p95 0.62). The neuron-dropping curve rises steadily (1 unit 0.01, 10 units 0.30, 32 units
   0.51, all 58 units 0.70): position is spread over the population and more units would help.
