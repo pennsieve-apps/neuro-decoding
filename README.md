@@ -170,7 +170,50 @@ that fails (e.g. no decodable variable) is logged and skipped.
 
 ## Runtime
 
-RUNTIME_SECTION
+Measured in Docker (linux/amd64 emulation on an M-series Mac, `--cpus 2 --memory 4g`, the builder
+brief's Lambda recipe: read-only root, arbitrary user, only `/tmp` writable) on the demo data
+(`data/work/<demo>/neuro-align/`), with the defaults, on a host **shared with many other builds
+(load average 50-150)**, so wall times are pessimistic:
+
+| Session | Analyses | Wall time | Peak memory (cgroup) |
+|---|---|---|---|
+| Grosmark `sub-Buddy` (58 units, run epoch 8,523 bins → 2,131 bins of 0.1 s; 6 continuous variables + lap direction; embedding linked) | ridge, MLP, Bayes, kNN on CEBRA, nulls, dropping | 94 s | 670 MB |
+| IBL `sub-NR-0031` (186 units, 13 regions, 80,064 → 20,016 bins; 6 continuous + 7 trial variables) | everything, incl. 4 regions and communication subspaces | 2,104 s (continuous variables ~5 min each; trial variables ~30 s each; RRR 29 s) | 1,311 MB |
+| Synthetic fixture (3 sessions) | everything | 120-210 s | 0.5 GB |
+
+The time goes into the nulls (200 shifts per variable and 100 per region; each is one matrix
+product thanks to a per-fold decomposition) and the MLP. On a typical session with few variables
+the step fits Lambda's 15 minutes; a large IBL session with every pose variable does not, so
+`timeoutSeconds` is 3600 on standard compute (`N_SHUFFLES=100` or naming `VARIABLES` halves it).
+
+## Demo results
+
+`data/work/<demo>/neuro-decoding/`:
+
+- **Grosmark & Buzsáki, rat Buddy** (58 CA1 units, running epoch): 1-D track position decoded with
+  R² **0.70** (ridge, 1 s of history; null 95th percentile -0.10, p = 0.005 with 200 circular
+  shifts), **0.80** (MLP) and **0.72** (Bayesian decoder; median error **7.7 cm** along a path of about 2 m); kNN on the CEBRA-Behavior embedding (held-out bins) 0.53, on CEBRA-Time 0.44.
+  Running speed R² 0.45-0.47; lap direction (out / in) balanced accuracy **0.89** (chance 0.5,
+  null p95 0.62). The neuron-dropping curve rises steadily (1 unit 0.01, 10 units 0.30, 32 units
+  0.51, all 58 units 0.70): position is spread over the population and more units would help.
+  One region only, so no communication subspaces.
+- **IBL `sub-NR-0031`** (186 units): wheel velocity R² **0.17** with ridge and **0.40** with the
+  MLP (null p95 -0.04); right / left paw speed 0.44 / 0.40, nose tip 0.28, pupil 0.29, licks 0.05
+  (all p = 0.005). Trial variables in a -0.1 to 0.5 s window around the stimulus, against IBL
+  pseudo-sessions: **choice** balanced accuracy **0.86** (pseudo-session null p95 0.55, corrected
+  +0.36), **stimulus side 0.78** (null p95 0.57, corrected +0.30), reward 0.67 (corrected +0.17);
+  the block prior (`probability_left`) is *not* decodable in this window (0.57 vs null p95 0.67,
+  p = 0.40), which a label shuffle would have wrongly reported as significant (shuffle null p95
+  0.38 in an earlier run). Per region (corrected scores): stimulus side in the midbrain reticular
+  nucleus +0.25 and anterior pretectal nucleus +0.20, not in CA1 or the dentate gyrus; choice in all
+  four (APN +0.29, MRN +0.30, CA1 +0.08, DG +0.11; the window includes the movement). Communication
+  subspaces (`rrr.csv`): MRN and APN predict each other's held-out units with R² 0.10-0.13 through
+  1-4 dimensions (within region: 0.36 for MRN, 0.17 for APN), and CA1 units at a similar level
+  (0.08-0.13), while the dentate gyrus (16 units) shares almost nothing with the others (R² ≤ 0.02).
+- **Synthetic fixture** (tests): the planted structure is recovered: position R² > 0.5 (Bayes >
+  0.6, CEBRA-kNN > 0.5) and held-out-session decoding beats no alignment; VISp decodes the stimulus
+  side, MOs the choice and wheel, CA1 nothing (p > 0.05); the VISp-MOs shared latent gives a
+  rank ≤ 2 communication subspace with R² above CA1's.
 
 ## Limitations
 
