@@ -24,22 +24,25 @@ from processor.common import Heartbeat, app_version, peak_rss_mb, rel, setup_log
 log = setup_logging("neuro-decoding")
 
 APP = "neuro-decoding"
-DECODERS = ("ridge", "mlp", "bayes", "logistic", "knn")
+DECODERS = ("ridge", "mlp", "bayes", "logistic", "knn", "rrr")
 DEFAULTS = {
     "VARIABLES": "auto",
     "TRIAL_VARIABLES": "auto",
     "TRIAL_ALIGN": "auto",
     "TRIAL_WINDOW_S": "-0.1,0.5",
     "DECODE_BIN_S": "0.1",
-    "SMOOTH_S": "0.2",
+    "SMOOTH_S": "0.05",
+    "HISTORY_BINS": "10",
     "CV_FOLDS": "5",
     "CV_GAP_S": "2.0",
     "N_SHUFFLES": "200",
     "MIN_SHIFT_S": "20",
-    "DECODERS": "ridge,mlp,bayes,logistic,knn",
+    "DECODERS": "ridge,mlp,bayes,logistic,knn,rrr",
     "N_POS_BINS": "40",
     "DROP_REPEATS": "10",
     "MIN_REGION_NEURONS": "10",
+    "MIN_UNITS_PER_REGION": "10",
+    "RRR_MAX_RANK": "10",
     "HELDOUT_DIMS": "10",
     "KNN_K": "25",
     "TRACE_WINDOW_S": "60",
@@ -49,7 +52,7 @@ DEFAULTS = {
 PARAMETERS = tuple(DEFAULTS)
 CSV_COLUMNS = ["session_id", "subject_id", "condition", "group", "variable", "kind", "unit", "decoder", "features",
                "region", "n_neurons", "n_samples", "cv", "metric", "score", "score_sd", "r", "median_abs_error",
-               "chance", "null", "null_mean", "null_sd", "null_p95", "p_value", "z", "n_shuffles"]
+               "chance", "null", "score_corrected", "null_mean", "null_sd", "null_p95", "p_value", "z", "n_shuffles"]
 BAYES_WINDOW_S = 0.5   # spike counts of the Bayesian decoder are summed over this centred window
 CITATIONS = ["10.1523/ENEURO.0506-19.2020", "10.1038/s41586-023-06031-6"]
 
@@ -77,7 +80,7 @@ def read_parameters(env=os.environ) -> dict:
         raise ParameterError(f"DECODERS must be a subset of {', '.join(DECODERS)}, got {', '.join(bad)}")
     p["DECODERS"] = sorted(set(dec) | {"ridge"}, key=DECODERS.index)
     try:
-        for k in ("CV_FOLDS", "N_SHUFFLES", "N_POS_BINS", "DROP_REPEATS", "MIN_REGION_NEURONS", "HELDOUT_DIMS",
+        for k in ("CV_FOLDS", "HISTORY_BINS", "N_SHUFFLES", "N_POS_BINS", "DROP_REPEATS", "MIN_REGION_NEURONS", "MIN_UNITS_PER_REGION", "RRR_MAX_RANK", "HELDOUT_DIMS",
                   "KNN_K", "SEED", "THREADS"):
             p[k] = int(raw[k])
         for k in ("DECODE_BIN_S", "SMOOTH_S", "CV_GAP_S", "MIN_SHIFT_S", "TRACE_WINDOW_S"):
@@ -88,6 +91,10 @@ def read_parameters(env=os.environ) -> dict:
     if len(w) != 2 or w[1] <= w[0]:
         raise ParameterError("TRIAL_WINDOW_S must be 'start,stop' (s, relative to TRIAL_ALIGN), stop > start")
     p["TRIAL_WINDOW_S"] = w
+    if p["MIN_UNITS_PER_REGION"] < 4 or p["RRR_MAX_RANK"] < 1:
+        raise ParameterError("MIN_UNITS_PER_REGION >= 4 and RRR_MAX_RANK >= 1 required")
+    if p["HISTORY_BINS"] < 1 or p["HISTORY_BINS"] > 100:
+        raise ParameterError("HISTORY_BINS must be in 1..100")
     if p["CV_FOLDS"] < 2 or p["N_SHUFFLES"] < 0 or p["N_POS_BINS"] < 5 or p["DROP_REPEATS"] < 1 \
             or p["MIN_REGION_NEURONS"] < 2 or p["HELDOUT_DIMS"] < 1 or p["KNN_K"] < 1 or p["THREADS"] < 0:
         raise ParameterError("CV_FOLDS >= 2, N_SHUFFLES >= 0, N_POS_BINS >= 5, DROP_REPEATS >= 1, "
@@ -135,7 +142,27 @@ def direction_of(y, dt):
     return np.where(v > thr, 1, np.where(v < -thr, -1, 0))
 
 
+def lagged(F, H: int):
+    """[F(t), F(t-1), ..., F(t-H+1)] side by side (past bins; the first bins repeat the first row)."""
+    import numpy as np
+
+    F = F.astype(np.float32)
+    if H <= 1:
+        return F
+    out = np.empty((F.shape[0], F.shape[1] * H), np.float32)
+    for lag in range(H):
+        sh = np.empty_like(F)
+        sh[lag:] = F[: F.shape[0] - lag] if lag else F
+        sh[:lag] = F[0]
+        out[:, lag * F.shape[1]:(lag + 1) * F.shape[1]] = sh
+    return out
+
+
 def run_session(s, p, emb_path, out_dir: Path, A, D, F, hb):
+    from processor import pseudo as P
+    from processor import rrr as R
+
+    rrr_fig = None
     import numpy as np
 
     sid = s.session_id
@@ -156,7 +183,14 @@ def run_session(s, p, emb_path, out_dir: Path, A, D, F, hb):
         res["regions"] = {r: int(len(i)) for r, i in regions}
         if len(regions) < 2 and not (len(regions) == 1 and len(names) > 1):
             regions = regions if len(names) > 1 else None
-    Fall = features(s, p["SMOOTH_S"])
+    Fbase = features(s, p["SMOOTH_S"])
+    H = p["HISTORY_BINS"]
+    Fall = lagged(Fbase, H)
+    n_neu = Fbase.shape[1]
+
+    def lag_cols(neurons):   # the lagged columns of a set of neurons
+        neurons = np.asarray(neurons)
+        return np.concatenate([lag * n_neu + neurons for lag in range(H)])
     ep = s.epoch_mask
 
     def row(var, kind, unit, decoder, region, n_neu, n_samp, cv, metric, res_, chance=None, null=None, nst=None,
@@ -166,6 +200,11 @@ def run_session(s, p, emb_path, out_dir: Path, A, D, F, hb):
              "score": res_.get("score"), "score_sd": res_.get("score_sd"), "r": res_.get("r"),
              "median_abs_error": res_.get("median_abs_error"), "chance": chance, "null": null}
         r.update({k: v for k, v in (nst or {}).items() if k in CSV_COLUMNS})
+        if r.get("score") is not None and r.get("null_mean") is not None:
+            # IBL's "corrected" score: decoding minus the null mean. For R² a negative null mean (shifted
+            # behaviour predicts worse than its own mean) is not credited: R² minus max(null mean, 0).
+            base = max(r["null_mean"], 0.0) if metric == "r2" else r["null_mean"]
+            r["score_corrected"] = r["score"] - base
         rows.append(r)
         return r
 
@@ -195,7 +234,8 @@ def run_session(s, p, emb_path, out_dir: Path, A, D, F, hb):
         null = D.circular_null(Fv, y, tv, folds, rd["alpha"], p["N_SHUFFLES"], p["MIN_SHIFT_S"], rng) if p["N_SHUFFLES"] else np.array([])
         nst = D.null_stats(rd["score"], null)
         cv = f"blocked {len(folds)}-fold, gap {p['CV_GAP_S']:g} s"
-        row(var, "continuous", unit, "ridge", "all", s.X.shape[1], idx.size, cv, "r2", rd, None, "circular shift", nst)
+        row(var, "continuous", unit, "ridge", "all", s.X.shape[1], idx.size, cv, "r2", rd, None, "circular shift", nst,
+            feats=f"activity, {H} bins of history")
         vres = {"ridge_r2": rd["score"], "ridge_r": rd["r"], "null_p95": nst["null_p95"], "p_value": nst["p_value"],
                 "z": nst["z"], "median_abs_error": rd["median_abs_error"], "unit": unit}
         nulls.append({"var": var, "metric": "R²", "chance": None, "items": [{"label": "ridge, all", "score": rd["score"], **nst}]})
@@ -203,7 +243,7 @@ def run_session(s, p, emb_path, out_dir: Path, A, D, F, hb):
         if "mlp" in p["DECODERS"]:
             ml = D.mlp_cv(Fv, y, folds, p["SEED"])
             preds["mlp"] = ml
-            row(var, "continuous", unit, "mlp", "all", s.X.shape[1], idx.size, cv, "r2", ml)
+            row(var, "continuous", unit, "mlp", "all", s.X.shape[1], idx.size, cv, "r2", ml, feats=f"activity, {H} bins of history")
             vres["mlp_r2"] = ml["score"]
         if "bayes" in p["DECODERS"] and s.is_counts and A.is_position(var, s.variables.get(var)):
             k = max(1, int(round(BAYES_WINDOW_S / dt)))
@@ -236,16 +276,18 @@ def run_session(s, p, emb_path, out_dir: Path, A, D, F, hb):
         if regions:
             items = nulls[-1]["items"]
             for reg, ii in regions:
-                rr = D.ridge_cv(Fv[:, ii], y, folds)
-                nn = D.circular_null(Fv[:, ii], y, tv, folds, rr["alpha"], min(p["N_SHUFFLES"], 100), p["MIN_SHIFT_S"], rng) \
+                ci = lag_cols(ii)
+                rr = D.ridge_cv(Fv[:, ci], y, folds)
+                nn = D.circular_null(Fv[:, ci], y, tv, folds, rr["alpha"], min(p["N_SHUFFLES"], 100), p["MIN_SHIFT_S"], rng) \
                     if p["N_SHUFFLES"] else np.array([])
                 ns = D.null_stats(rr["score"], nn)
-                row(var, "continuous", unit, "ridge", reg, int(len(ii)), idx.size, cv, "r2", rr, None, "circular shift", ns)
+                row(var, "continuous", unit, "ridge", reg, int(len(ii)), idx.size, cv, "r2", rr, None, "circular shift", ns,
+                    feats=f"activity, {H} bins of history")
                 items.append({"label": f"ridge, {reg} ({len(ii)})", "score": rr["score"], **ns})
                 vres.setdefault("regions", {})[reg] = {"r2": rr["score"], "p_value": ns["p_value"], "n_neurons": int(len(ii))}
         # neuron dropping
         drops.append({"name": var, "metric": "R²", "rows": D.dropping_curve(Fv, y, folds, "continuous", rd["alpha"],
-                                                                             p["DROP_REPEATS"], rng)})
+                                                                             p["DROP_REPEATS"], rng, lag_cols)})
         # trace window: start of the middle fold
         tr_f = folds[len(folds) // 2][1]
         tt = tv[tr_f]
@@ -257,11 +299,42 @@ def run_session(s, p, emb_path, out_dir: Path, A, D, F, hb):
         trace_panels.append({"name": var, "unit": unit, "t": tt[w], "true": y[tr_f][w], "preds": pl})
         decodable = (nst["p_value"] is not None and nst["p_value"] < 0.05) if p["N_SHUFFLES"] else rd["score"] > 0.1
         if decodable:   # held-out-session decoding only for variables this session decodes
-            heldout_data[var] = (Fv, y, direction_of(y, dt) if A.is_position(var, s.variables.get(var)) else None)
+            heldout_data[var] = (Fbase[idx], y, direction_of(y, dt) if A.is_position(var, s.variables.get(var)) else None)
         vres["seconds"] = round(time.monotonic() - t0, 1)
         res["variables"][var] = vres
         hb(f"{sid} {var}: ridge R2 {rd['score']:.3f} (null p95 {nst['null_p95'] if nst['null_p95'] is None else round(nst['null_p95'], 3)}), "
            f"{vres['seconds']}s", force=True)
+
+    # --- communication subspaces between regions (reduced-rank regression) ---
+    res["rrr_rows"] = []
+    if "rrr" in p["DECODERS"]:
+        rrr_regions = {}
+        if s.regions:
+            arr = np.array(s.regions)
+            for r in sorted(set(s.regions)):
+                ii = np.flatnonzero(arr == r)
+                if ii.size >= p["MIN_UNITS_PER_REGION"] and r.lower() not in ("unknown", "root", "void", ""):
+                    rrr_regions[r] = ii
+        if len(rrr_regions) < 2:
+            why_rrr = ("units carry no brain region" if not s.regions else
+                       f"{len(rrr_regions)} region(s) with >= {p['MIN_UNITS_PER_REGION']} units")
+            log.info("%s: communication subspaces skipped (%s)", sid, why_rrr)
+            res["rrr"] = {"status": "skipped", "reason": why_rrr}
+        else:
+            t0 = time.monotonic()
+            ep_idx = np.flatnonzero(ep)
+            Fr = Fbase[ep_idx]
+            folds_r = D.blocked_folds(s.t[ep_idx], p["CV_FOLDS"], p["CV_GAP_S"])
+            rr_rows = R.communication(Fr, rrr_regions, folds_r, np.random.default_rng(p["SEED"]), p["RRR_MAX_RANK"])
+            for r in rr_rows:
+                r.update(session_id=sid, n_bins=int(ep_idx.size))
+            res["rrr_rows"] = rr_rows
+            res["rrr"] = {"regions": {k: int(v.size) for k, v in rrr_regions.items()},
+                          "seconds": round(time.monotonic() - t0, 1),
+                          "pairs": [{k: r[k] for k in ("source", "target", "kind", "full_r2", "optimal_rank", "within_r2")}
+                                    for r in rr_rows]}
+            rrr_fig = (rr_rows, list(rrr_regions))
+            hb(f"{sid}: communication subspaces between {len(rrr_regions)} regions in {res['rrr']['seconds']}s", force=True)
 
     # --- categorical trial variables ---
     if p["TRIAL_VARIABLES"] != [] and "logistic" in p["DECODERS"]:
@@ -271,7 +344,9 @@ def run_session(s, p, emb_path, out_dir: Path, A, D, F, hb):
             al = A.align_column(trials, p["TRIAL_ALIGN"])
             Xt, ok = A.trial_counts(raw, trials, al, tuple(p["TRIAL_WINDOW_S"]))
             Ft = np.sqrt(Xt) if raw.is_counts else Xt
-            res["trials"] = {"n_trials": int(len(trials)), "align": al, "window_s": p["TRIAL_WINDOW_S"]}
+            pseudo = P.ibl_task(trials, tvars)
+            res["trials"] = {"n_trials": int(len(trials)), "align": al, "window_s": p["TRIAL_WINDOW_S"],
+                             "null": "pseudo-sessions (IBL task model)" if pseudo is not None else "trial-label shuffles"}
             for var, lab in tvars.items():
                 keep = ok & np.array([v is not None for v in lab])
                 levels, counts = np.unique(lab[keep].astype(str), return_counts=True)
@@ -289,21 +364,34 @@ def run_session(s, p, emb_path, out_dir: Path, A, D, F, hb):
                 t0 = time.monotonic()
                 lg = D.logistic_cv(Fk, yk, folds, p["SEED"])
                 chance = 1.0 / good.size
-                null = D.shuffle_null(Fk, yk, folds, lg["C"], p["N_SHUFFLES"], rng) if p["N_SHUFFLES"] else np.array([])
+                gen = P.pseudo_labels(trials, var, tvars, keep) if pseudo is not None else None
+                null_kind = "pseudo-session" if gen is not None else "trial-label shuffle"
+                if p["N_SHUFFLES"] == 0:
+                    null = np.array([])
+                elif gen is not None:
+                    null = D.pseudo_null(Fk, yk, folds, lg["C"], [gen(rng) for _ in range(p["N_SHUFFLES"])])
+                else:
+                    null = D.shuffle_null(Fk, yk, folds, lg["C"], p["N_SHUFFLES"], rng)
                 nst = D.null_stats(lg["score"], null)
                 cv = f"blocked {len(folds)}-fold over trials"
                 row(var, "categorical", "", "logistic", "all", raw.X.shape[1], int(yk.size), cv, "balanced_accuracy", lg,
-                    chance, "trial-label shuffle", nst, feats=f"counts in [{p['TRIAL_WINDOW_S'][0]:g}, {p['TRIAL_WINDOW_S'][1]:g}] s of {al}")
-                vres = {"balanced_accuracy": lg["score"], "chance": chance, "null_p95": nst["null_p95"],
+                    chance, null_kind, nst, feats=f"counts in [{p['TRIAL_WINDOW_S'][0]:g}, {p['TRIAL_WINDOW_S'][1]:g}] s of {al}")
+                vres = {"balanced_accuracy": lg["score"], "chance": chance, "null": null_kind, "null_p95": nst["null_p95"],
                         "p_value": nst["p_value"], "z": nst["z"], "classes": good.tolist(), "n_trials": int(yk.size)}
                 items = [{"label": "logistic, all", "score": lg["score"], **nst}]
                 if regions:
                     for reg, ii in regions:
                         lr = D.logistic_cv(Fk[:, ii], yk, folds, p["SEED"])
-                        nn = D.shuffle_null(Fk[:, ii], yk, folds, lr["C"], min(p["N_SHUFFLES"], 100), rng) if p["N_SHUFFLES"] else np.array([])
+                        n_reg = min(p["N_SHUFFLES"], 100)
+                        if n_reg == 0:
+                            nn = np.array([])
+                        elif gen is not None:
+                            nn = D.pseudo_null(Fk[:, ii], yk, folds, lr["C"], [gen(rng) for _ in range(n_reg)])
+                        else:
+                            nn = D.shuffle_null(Fk[:, ii], yk, folds, lr["C"], n_reg, rng)
                         ns = D.null_stats(lr["score"], nn)
                         row(var, "categorical", "", "logistic", reg, int(len(ii)), int(yk.size), cv, "balanced_accuracy",
-                            lr, chance, "trial-label shuffle", ns, feats=f"counts in window of {al}")
+                            lr, chance, null_kind, ns, feats=f"counts in window of {al}")
                         items.append({"label": f"logistic, {reg} ({len(ii)})", "score": lr["score"], **ns})
                         vres.setdefault("regions", {})[reg] = {"balanced_accuracy": lr["score"], "p_value": ns["p_value"],
                                                                "n_neurons": int(len(ii))}
@@ -338,6 +426,14 @@ def run_session(s, p, emb_path, out_dir: Path, A, D, F, hb):
             f"{p['MIN_SHIFT_S']:g} s, or shuffling trial labels; tick: median). "
             + ("Further columns decode from one brain region at a time (number of neurons in brackets). " if regions else "")
             + "A score is meaningful only when it clears its null; the dotted line is chance (0 for R²).")})
+    if rrr_fig:
+        figs.append({"path": F.rrr_matrix(sid, *rrr_fig, d / f"{sid}_rrr.png"), "caption": (
+            f"{sid}: communication between brain regions (reduced-rank regression, Semedo et al. 2019). Left: how well "
+            "each source region's activity (rows) predicts held-out units of each target region (columns), cross-"
+            "validated R² of a ridge model; the diagonal is the target region predicted from its own other units, "
+            "with the same number of predictors. Right: the number of dimensions needed (optimal rank). An "
+            "off-diagonal rank lower than the diagonal one means the regions talk through a low-dimensional "
+            "'communication subspace' rather than sharing all of their activity.")})
     if drops:
         figs.append({"path": F.dropping(sid, drops, d / f"{sid}_dropping.png"), "caption": (
             f"{sid}: neuron-dropping curve, the decoding score with random subsets of neurons (mean ± SD over "
@@ -377,14 +473,19 @@ def main() -> int:
     if not input_dir.is_dir():
         log.error("INPUT_DIR %s is not a folder", input_dir)
         return 1
-    os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
+    import tempfile
+
+    os.environ.setdefault("MPLCONFIGDIR", os.path.join(tempfile.gettempdir(), "mpl"))
     from processor.resources import resolve_threads, set_thread_env
 
     threads, thread_src = resolve_threads(p["THREADS"])
     set_thread_env(threads)
+    import numpy as np
+
     from processor import aligned as A
     from processor import decoders as D
     from processor import figures as F
+    from processor import pseudo as P
 
     found = A.discover(input_dir, "aligned")
     for name, reason in found.skipped.items():
@@ -401,6 +502,7 @@ def main() -> int:
     hb = Heartbeat(log, "progress", 30)
     all_rows, drop_rows, results, statuses, figures_all, warnings = [], [], {}, {}, [], []
     ho_inputs: dict[str, dict] = {}
+    rrr_all: list[dict] = []
     for sid, path in found.sessions:
         t0 = time.monotonic()
         try:
@@ -410,6 +512,7 @@ def main() -> int:
             for c in drops:
                 for r in c["rows"]:
                     drop_rows.append({"session_id": sid, "variable": c["name"], **r})
+            rrr_all += res.pop("rrr_rows", [])
             for var, v in ho.items():
                 ho_inputs.setdefault(var, {})[sid] = v
             write_json(out / sid / "summary.json", {"app": APP, "version": app_version(), **res})
@@ -462,12 +565,36 @@ def main() -> int:
         write_csv(out / "heldout.csv", ho_rows, ["variable", "session_id", "train_sessions", "reference", "n_dims",
                                                   "n_conditions_matched", "n_test", "within_session", "aligned", "unaligned"])
     write_csv(out / "decoding.csv", all_rows, CSV_COLUMNS)
+    # per variable x region (x decoder) across sessions: mean score, mean null-corrected score and the
+    # sessions' p-values combined with Fisher's method (as the IBL brain-wide map does)
+    from scipy.stats import combine_pvalues
+
+    groups: dict = {}
+    for r in all_rows:
+        if r.get("p_value") is None or str(r.get("cv", "")).startswith("held-out"):
+            continue
+        groups.setdefault((r["variable"], r["region"], r["decoder"], r["metric"]), []).append(r)
+    reg_rows = []
+    for (var, region, dec, metric), rs in sorted(groups.items()):
+        ps = [max(float(r["p_value"]), 1e-12) for r in rs]
+        fisher = float(combine_pvalues(ps, method="fisher").pvalue) if len(ps) > 1 else ps[0]
+        reg_rows.append({"variable": var, "region": region, "decoder": dec, "metric": metric, "n_sessions": len(rs),
+                         "n_neurons": sum(int(r.get("n_neurons") or 0) for r in rs),
+                         "mean_score": float(np.mean([r["score"] for r in rs])),
+                         "mean_score_corrected": float(np.mean([r["score_corrected"] for r in rs if r.get("score_corrected") is not None] or [np.nan])),
+                         "fisher_p": fisher, "null": rs[0].get("null")})
+    if reg_rows:
+        write_csv(out / "regions.csv", reg_rows, ["variable", "region", "decoder", "metric", "n_sessions", "n_neurons",
+                                                  "mean_score", "mean_score_corrected", "fisher_p", "null"])
+    if rrr_all:
+        write_csv(out / "rrr.csv", rrr_all, ["session_id", "source", "target", "kind", "n_source", "n_target", "n_bins",
+                                            "optimal_rank", "rrr_r2", "full_r2", "within_r2", "within_rank"])
     write_csv(out / "dropping.csv", drop_rows, ["session_id", "variable", "n_neurons", "mean", "sd", "repeats"])
     headline = {sid: {k: r.get(k) for k in ("n_neurons", "decode_bin_s", "neural_source", "regions", *A.SHEET_KEYS)
                       if r.get(k) is not None} | {"variables": r["variables"]} for sid, r in results.items()}
     write_json(out / "summary.json", {
         "app": APP, "version": app_version(), "sessions": headline, "heldout_session": ho_summary,
-        "figures": figures_all, "tables": ["decoding.csv", "dropping.csv"] + (["heldout.csv"] if ho_rows else []),
+        "figures": figures_all, "tables": ["decoding.csv", "dropping.csv"] + (["regions.csv"] if reg_rows else []) + (["rrr.csv"] if rrr_all else []) + (["heldout.csv"] if ho_rows else []),
         "warnings": warnings, "n_ok": len(results), "n_failed": len(statuses) - len(results)})
     write_json(out / "provenance.json", {
         "app": APP, "version": app_version(), "variant": "default",

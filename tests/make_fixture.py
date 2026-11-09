@@ -141,9 +141,13 @@ def ibl_session(seed: int, n_trials: int, t_start: float):
         choice_drive[c] += choice[k]
     wheel += 0.2 * rng.standard_normal(t.size)
     regions = ["VISp"] * 30 + ["MOs"] * 30 + ["CA1"] * 20
+    # a slow latent shared by VISp and MOs (not CA1): a one-dimensional "communication subspace"
+    shared = np.zeros(t.size)
+    for i in range(1, t.size):
+        shared[i] = shared[i - 1] * np.exp(-BIN / 0.5) + np.sqrt(1 - np.exp(-2 * BIN / 0.5)) * rng.standard_normal()
     rates = np.empty((t.size, len(regions)))
     for j, reg in enumerate(regions):
-        base = rng.uniform(1, 6)
+        base = rng.uniform(1, 6) * (np.exp(0.6 * shared * (1 if j % 2 else -1)) if reg in ("VISp", "MOs") else 1.0)
         if reg == "VISp":
             pref = 1 if j % 3 else -1                  # mostly right-stimulus (contralateral) units
             rates[:, j] = base * np.exp(0.9 * pref * stim_drive)
@@ -165,7 +169,8 @@ def ibl_session(seed: int, n_trials: int, t_start: float):
         "contrast_right": contrast_right, "feedback_type": np.where(correct, 1.0, -1.0),
         "probability_left": prob_left})
     variables = [{"name": "wheel_velocity", "unit": "rad/s", "source": "processing/behavior/WheelVelocity", "kind": "continuous"}]
-    truth = {"stimulus_units": "VISp", "choice_and_wheel_units": "MOs", "unrelated_units": "CA1"}
+    truth = {"stimulus_units": "VISp", "choice_and_wheel_units": "MOs", "unrelated_units": "CA1",
+             "shared_latent": "VISp and MOs share one slow latent (tau 0.5 s)"}
     return dict(t=t, X=X, Y=wheel[:, None].astype(np.float32), ids=ids, meta=_meta(regions, rng),
                 names=["wheel_velocity"], epoch=np.ones(t.size, bool), events=trials, spikes=spikes,
                 variables=variables, truth=truth, epoch_name="all")

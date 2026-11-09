@@ -8,8 +8,10 @@ application:
     regression, a small neural network (MLP) and, for position, a Bayesian population decoder;
     trial variables (e.g. IBL choice and stimulus side) with logistic regression. Folds are
     contiguous blocks of time or trials with a gap, never shuffled bins; each score is compared with
-    a null distribution (behaviour circularly shifted in time, or trial labels shuffled). Also:
-    neuron-dropping curves, decoding per brain region (when units carry one, e.g. IBL), decoding a
+    a null distribution (behaviour circularly shifted in time; IBL pseudo-sessions or shuffled
+    labels for trial variables), with null-corrected scores and Fisher-combined p-values per region.
+    Also: neuron-dropping curves, decoding per brain region (when units carry one, e.g. IBL),
+    communication subspaces between regions (reduced-rank regression), decoding a
     held-out session through aligned latent dynamics when several sessions share a variable, and
     kNN decoding from CEBRA embeddings when neuro-embedding's output is linked. Writes
     decoding.csv, summary.json and figures (decoded vs true traces, score vs null, neuron-dropping).
@@ -60,8 +62,16 @@ parameters:
   - name: SMOOTH_S
     type: number
     description: SD (s) of the Gaussian smoothing of the activity features (square-root counts) of the continuous decoders.
-    defaultValue: 0.2
+    defaultValue: 0.05
     min: 0
+  - name: HISTORY_BINS
+    type: integer
+    description: >-
+      Bins of history in the ridge and MLP features: the current bin and the HISTORY_BINS - 1
+      before it of every neuron, side by side (10 = 1 s at 0.1 s bins).
+    defaultValue: 10
+    min: 1
+    max: 100
   - name: CV_FOLDS
     type: integer
     description: Contiguous cross-validation folds (blocks of time, or of trials).
@@ -75,8 +85,9 @@ parameters:
   - name: N_SHUFFLES
     type: integer
     description: >-
-      Null-distribution size: circular shifts of the behaviour (continuous variables) or trial
-      label shuffles (trial variables); per-region nulls use at most 100. 0 = no nulls.
+      Null-distribution size: circular shifts of the behaviour (continuous variables), IBL
+      pseudo-sessions (trial variables of IBL-style tasks) or trial-label shuffles (other trial
+      variables); per-region nulls use at most 100. 0 = no nulls.
     defaultValue: 200
     min: 0
   - name: MIN_SHIFT_S
@@ -88,8 +99,9 @@ parameters:
     type: string
     description: >-
       Comma-separated subset of ridge (always run), mlp, bayes (position, spiking data), logistic
-      (trial variables), knn (CEBRA embeddings, when the embedding port is linked).
-    defaultValue: "ridge,mlp,bayes,logistic,knn"
+      (trial variables), knn (CEBRA embeddings, when the embedding port is linked), rrr
+      (communication subspaces between brain regions).
+    defaultValue: "ridge,mlp,bayes,logistic,knn,rrr"
   - name: N_POS_BINS
     type: integer
     description: Position bins of the Bayesian decoder's tuning curves.
@@ -105,6 +117,16 @@ parameters:
     description: Brain regions with at least this many neurons are also decoded on their own.
     defaultValue: 10
     min: 2
+  - name: MIN_UNITS_PER_REGION
+    type: integer
+    description: Regions with at least this many units enter the communication-subspace (reduced-rank regression) analysis.
+    defaultValue: 10
+    min: 4
+  - name: RRR_MAX_RANK
+    type: integer
+    description: Largest rank tried by the reduced-rank regression between regions.
+    defaultValue: 10
+    min: 1
   - name: HELDOUT_DIMS
     type: integer
     description: PCA dimensions of the aligned latent space of held-out-session decoding.
@@ -129,12 +151,18 @@ parameters:
     description: CPU threads for BLAS; 0 = from the container's CPU quota.
     defaultValue: 0
     min: 0
-# Input ports take any file: neuro-align's and neuro-embedding's ports hold .npz, .parquet, .json, .csv and figures.
+# Input media types: what the sibling app's output port declares (conventions.md, "Port media types").
 inputs:
   - name: aligned
     description: >-
       neuro-align's aligned output: neuro-align/<session_id>/aligned.npz, events.parquet (trials),
       manifest.json, one folder per session; found by name anywhere below the port (or INPUT_DIR).
+    mediaTypes:
+      - application/octet-stream
+      - application/vnd.apache.parquet
+      - application/json
+      - text/csv
+      - image/png
     placement: subfolder
     required: true
   - name: embedding
@@ -142,6 +170,12 @@ inputs:
       Optional: neuro-embedding's output (neuro-embedding/<session_id>/<session_id>_embeddings.npz);
       adds kNN decoding from the CEBRA-Time embedding (blocked CV) and the CEBRA-Behavior embedding
       (on the bins neuro-embedding held out of training).
+    mediaTypes:
+      - application/octet-stream
+      - image/png
+      - text/html
+      - text/csv
+      - application/json
     placement: subfolder
     required: false
 outputs:
@@ -149,9 +183,10 @@ outputs:
     description: >-
       neuro-decoding/: decoding.csv (session_id, subject_id, condition, group, variable, kind, unit,
       decoder, features, region, n_neurons, n_samples, cv, metric, score, score_sd, r,
-      median_abs_error, chance, null, null_mean, null_sd, null_p95, p_value, z, n_shuffles),
-      dropping.csv, heldout.csv and heldout_<variable>.png (two or more sessions), summary.json,
-      provenance.json; <session_id>/<session_id>_decoded_traces.png, _null.png, _dropping.png,
+      median_abs_error, chance, null, score_corrected, null_mean, null_sd, null_p95, p_value, z,
+      n_shuffles), regions.csv (Fisher-combined per region), rrr.csv (source, target, optimal rank,
+      cv R², full-model R², within-region R², n units), dropping.csv, heldout.csv and heldout_<variable>.png (two or more sessions), summary.json,
+      provenance.json; <session_id>/<session_id>_decoded_traces.png, _null.png, _dropping.png, _rrr.png,
       summary.json.
     mediaTypes:
       - text/csv

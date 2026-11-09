@@ -238,15 +238,29 @@ def neuron_sizes(n: int, k: int = 8) -> list[int]:
     return sorted({int(x) for x in np.unique(np.round(np.geomspace(1, n, k)))})
 
 
-def dropping_curve(F, y, folds, kind: str, param: float, repeats: int, rng) -> list[dict]:
-    """Score vs number of neurons, random subsets (repeats per size) with the full model's alpha / C."""
-    n = F.shape[1]
+def pseudo_null(F, y, folds, C, pseudo_labels: list) -> np.ndarray:
+    """Logistic decoding of pseudo-session labels (same neural data, labels from the task's generative
+    model): IBL's null for trial variables (Findling et al. 2025; IBL 2025)."""
+    out = []
+    for lab in pseudo_labels:
+        if lab is None or np.unique(lab).size < 2:
+            continue
+        out.append(logistic_score_fixed(F, lab, folds, C))
+    return np.array(out)
+
+
+def dropping_curve(F, y, folds, kind: str, param: float, repeats: int, rng, cols=None) -> list[dict]:
+    """Score vs number of neurons, random subsets (repeats per size) with the full model's alpha / C.
+    cols(neurons) gives the feature columns of a set of neurons (lagged features); default identity."""
+    n = F.shape[1] if cols is None else int(F.shape[1] // max(1, len(cols(np.array([0])))))
     rows = []
     for size in neuron_sizes(n):
         reps = 1 if size == n else repeats
         s = []
         for _ in range(reps):
             idx = rng.choice(n, size, replace=False)
+            if cols is not None:
+                idx = cols(idx)
             if kind == "continuous":
                 s.append(FastRidge(F[:, idx], folds, param).score(y))
             else:

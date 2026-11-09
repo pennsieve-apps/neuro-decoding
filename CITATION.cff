@@ -45,7 +45,7 @@ references:
   doi: 10.1523/eneuro.0506-19.2020
   identifiers:
   - type: other
-    value: PMID:32737181
+    value: '32737181'
     description: PubMed ID
 - type: article
   title: 'Interpreting Neuronal Population Activity by Reconstruction: Unified Framework With Application to Hippocampal
@@ -68,7 +68,7 @@ references:
   doi: 10.1152/jn.1998.79.2.1017
   identifiers:
   - type: other
-    value: PMID:9463459
+    value: '9463459'
     description: PubMed ID
 - type: article
   title: Long-term stability of cortical population dynamics underlying consistent behavior
@@ -92,7 +92,7 @@ references:
   doi: 10.1038/s41593-019-0555-4
   identifiers:
   - type: other
-    value: PMID:31907438
+    value: '31907438'
     description: PubMed ID
 - type: article
   title: Learnable latent embeddings for joint behavioural and neural analysis
@@ -112,7 +112,7 @@ references:
   doi: 10.1038/s41586-023-06031-6
   identifiers:
   - type: other
-    value: PMID:37138088
+    value: '37138088'
     description: PubMed ID
 - type: article
   title: Diversity in neural firing dynamics supports both rigid and learned hippocampal sequences
@@ -130,7 +130,7 @@ references:
   doi: 10.1126/science.aad1935
   identifiers:
   - type: other
-    value: PMID:27013730
+    value: '27013730'
     description: PubMed ID
 - type: data
   title: Diversity in neural firing dynamics supports both rigid and learned hippocampal sequences
@@ -563,7 +563,7 @@ references:
   doi: 10.1038/s41586-025-09235-0
   identifiers:
   - type: other
-    value: PMID:40903598
+    value: '40903598'
     description: PubMed ID
 - type: data
   title: IBL - Brain Wide Map
@@ -574,6 +574,284 @@ references:
   publisher:
     name: DANDI Archive
   version: 0.260309.1324
+- type: article
+  title: Brain-wide representations of prior information in mouse decision-making
+  authors:
+  - family-names: Findling
+    given-names: Charles
+  - family-names: Hubert
+    given-names: Félix
+  - name: International Brain Laboratory
+  - family-names: Acerbi
+    given-names: Luigi
+  - family-names: Benson
+    given-names: Brandon
+  - family-names: Benson
+    given-names: Julius
+  - family-names: Birman
+    given-names: Daniel
+  - family-names: Bonacchi
+    given-names: Niccolò
+  - family-names: Buchanan
+    given-names: E. Kelly
+  - family-names: Bruijns
+    given-names: Sebastian
+  - family-names: Carandini
+    given-names: Matteo
+  - family-names: Catarino
+    given-names: Joana A.
+  - family-names: Chapuis
+    given-names: Gaelle A.
+  - family-names: Churchland
+    given-names: Anne K.
+  - family-names: Dan
+    given-names: Yang
+  - family-names: Davatolhagh
+    given-names: Felicia
+  - family-names: DeWitt
+    given-names: Eric E. J.
+  - family-names: Engel
+    given-names: Tatiana A.
+  - family-names: Fabbri
+    given-names: Michele
+  - family-names: Faulkner
+    given-names: Mayo A.
+  - family-names: Fiete
+    given-names: Ila Rani
+  - family-names: Freitas-Silva
+    given-names: Laura
+  - family-names: Gerçek
+    given-names: Berk
+  - family-names: Harris
+    given-names: Kenneth D.
+  - family-names: Häusser
+    given-names: Michael
+  - family-names: Hofer
+    given-names: Sonja B.
+  - family-names: Hu
+    given-names: Fei
+  - family-names: Huntenburg
+    given-names: Julia M.
+  - family-names: Khanal
+    given-names: Anup
+  - family-names: Krasniak
+    given-names: Chris
+  - family-names: Langdon
+    given-names: Christopher
+  - family-names: Langfield
+    given-names: Christopher A.
+  - family-names: Latham
+    given-names: Peter E.
+  - family-names: Lau
+    given-names: Petrina Y. P.
+  - family-names: Mainen
+    given-names: Zach
+  - family-names: Meijer
+    given-names: Guido T.
+  - family-names: Miska
+    given-names: Nathaniel J.
+  - family-names: Mrsic-Flogel
+    given-names: Thomas D.
+  - family-names: Noel
+    given-names: Jean-Paul
+  - family-names: Nylund
+    given-names: Kai
+  - family-names: Pan-Vazquez
+    given-names: Alejandro
+  - family-names: Paninski
+    given-names: Liam
+  - family-names: Pillow
+    given-names: Jonathan
+  - family-names: Rossant
+    given-names: Cyrille
+  - family-names: Roth
+    given-names: Noam
+  - family-names: Schaeffer
+    given-names: Rylan
+  - family-names: Schartner
+    given-names: Michael
+  - family-names: Shi
+    given-names: Yanliang
+  - family-names: Socha
+    given-names: Karolina Z.
+  - family-names: Steinmetz
+    given-names: Nicholas A.
+  - family-names: Svoboda
+    given-names: Karel
+  - family-names: Tessereau
+    given-names: Charline
+  - family-names: Urai
+    given-names: Anne E.
+  - family-names: Wells
+    given-names: Miles J.
+  - family-names: West
+    given-names: Steven Jon
+  - family-names: Whiteway
+    given-names: Matthew R.
+  - family-names: Winter
+    given-names: Olivier
+  - family-names: Witten
+    given-names: Ilana B.
+  - family-names: Zador
+    given-names: Anthony
+  - family-names: Zhang
+    given-names: Yizi
+  - family-names: Dayan
+    given-names: Peter
+  - family-names: Pouget
+    given-names: Alexandre
+  year: 2025
+  journal: Nature
+  volume: '645'
+  issue: '8079'
+  start: '192'
+  end: '200'
+  doi: 10.1038/s41586-025-09226-1
+  identifiers:
+  - type: other
+    value: '40903597'
+    description: PubMed ID
+- type: article
+  title: Cortical Areas Interact through a Communication Subspace
+  authors:
+  - family-names: Semedo
+    given-names: João D.
+  - family-names: Zandvakili
+    given-names: Amin
+  - family-names: Machens
+    given-names: Christian K.
+  - family-names: Yu
+    given-names: Byron M.
+  - family-names: Kohn
+    given-names: Adam
+  year: 2019
+  journal: Neuron
+  volume: '102'
+  issue: '1'
+  start: 249-259.e4
+  doi: 10.1016/j.neuron.2019.01.026
+  identifiers:
+  - type: other
+    value: '30770252'
+    description: PubMed ID
+- type: article
+  title: Multiplexed subspaces route neural activity across brain-wide networks
+  authors:
+  - family-names: MacDowell
+    given-names: Camden J.
+  - family-names: Libby
+    given-names: Alexandra
+  - family-names: Jahn
+    given-names: Caroline I.
+  - family-names: Tafazoli
+    given-names: Sina
+  - family-names: Ardalan
+    given-names: Adel
+  - family-names: Buschman
+    given-names: Timothy J.
+  year: 2025
+  journal: Nature Communications
+  volume: '16'
+  issue: '1'
+  start: '3359'
+  doi: 10.1038/s41467-025-58698-2
+  identifiers:
+  - type: other
+    value: '40204762'
+    description: PubMed ID
+- type: article
+  title: 'BrainWideBench: Benchmarking large-scale pretraining and across-animal transfer in multi-region neural
+    recordings'
+  authors:
+  - family-names: Andre
+    given-names: Alexandre
+  - family-names: Mahato
+    given-names: Shivashriganesh P.
+  - family-names: Arora
+    given-names: Vinam
+  - family-names: Balaji
+    given-names: Keshav
+  - family-names: Lachi
+    given-names: Divyansha
+  - family-names: Krishna
+    given-names: Nanda H.
+  - family-names: Xiao
+    given-names: Jingyun
+  - family-names: Zhang
+    given-names: Yizi
+  - family-names: Mao
+    given-names: Ximeng
+  - family-names: Ma
+    given-names: Wenrui
+  - family-names: Yu
+    given-names: Han
+  - family-names: Laboratory
+    given-names: International Brain
+  - family-names: Birman
+    given-names: Daniel
+  - family-names: Bonacchi
+    given-names: Niccolò
+  - family-names: Chapuis
+    given-names: Gaelle A.
+  - family-names: Catarino
+    given-names: Joana A.
+  - family-names: Davatolhagh
+    given-names: Felicia
+  - family-names: Faulkner
+    given-names: Mayo
+  - family-names: Freitas-Silva
+    given-names: Laura
+  - family-names: Hu
+    given-names: Fei
+  - family-names: Huntenburg
+    given-names: Julia M.
+  - family-names: Khanal
+    given-names: Anup
+  - family-names: Laranjeira
+    given-names: Inês
+  - family-names: Lau
+    given-names: Petrina
+  - family-names: Meijer
+    given-names: Guido T.
+  - family-names: Miska
+    given-names: Nathaniel J.
+  - family-names: Noel
+    given-names: Jean-Paul
+  - family-names: Pan-Vazquez
+    given-names: Alejandro
+  - family-names: Raiser
+    given-names: Georg
+  - family-names: Rossant
+    given-names: Cyrille
+  - family-names: Socha
+    given-names: Karolina Z.
+  - family-names: Urai
+    given-names: Anne E.
+  - family-names: Wells
+    given-names: Miles J.
+  - family-names: West
+    given-names: Steven J.
+  - family-names: Winter
+    given-names: Olivier
+  - family-names: Richards
+    given-names: Blake
+  - family-names: Lajoie
+    given-names: Guillaume
+  - family-names: Hurwitz
+    given-names: Cole
+  - family-names: Azabou
+    given-names: Mehdi
+  - family-names: Whiteway
+    given-names: Matthew R.
+  - family-names: Paninski
+    given-names: Liam
+  - family-names: Dyer
+    given-names: Eva L.
+  year: 2026
+  doi: 10.48550/arxiv.2609.22064
+  publisher:
+    name: arXiv
+  version: '1'
 - type: software
   title: scikit-learn
   authors:

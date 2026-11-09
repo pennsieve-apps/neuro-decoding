@@ -54,7 +54,7 @@ def _row(df, sid, var, decoder="ridge", region="all", features=None):
 
 
 def test_outputs(default_run):
-    for f in ("decoding.csv", "dropping.csv", "heldout.csv", "heldout_position.png", "summary.json", "provenance.json"):
+    for f in ("decoding.csv", "dropping.csv", "regions.csv", "rrr.csv", "heldout.csv", "heldout_position.png", "summary.json", "provenance.json"):
         assert (default_run / f).is_file(), f
     for sid in (RAT1, RAT2, IBL):
         for f in (f"{sid}_decoded_traces.png", f"{sid}_null.png", f"{sid}_dropping.png", "summary.json"):
@@ -92,6 +92,12 @@ def test_ibl_regions(default_run):
     ch = _row(df, IBL, "choice", "logistic", "MOs")
     assert ch.score > 0.85 and ch.p_value < 0.05 and ch.chance == 0.5
     assert _row(df, IBL, "choice", "logistic", "CA1").p_value > 0.05
+    # IBL-style task (prior blocks, contrasts): pseudo-session nulls, null-corrected scores
+    assert ch.null == "pseudo-session" and ch.score_corrected > 0.3
+    assert _row(df, IBL, "wheel_velocity").null == "circular shift"
+    reg = pd.read_csv(default_run / "regions.csv")
+    vis = reg[(reg.variable == "stimulus_side") & (reg.region == "VISp")].iloc[0]
+    assert vis.fisher_p < 0.05 and vis.n_sessions == 1
 
 
 def test_dropping_curve_rises(default_run):
@@ -134,3 +140,23 @@ def test_null_detects_nothing_in_noise():
     rd = D.ridge_cv(F, y, folds)
     st = D.null_stats(rd["score"], D.circular_null(F, y, t, folds, rd["alpha"], 50, 20, rng))
     assert st["p_value"] > 0.05
+
+
+def test_pseudo_sessions_follow_the_task():
+    from processor import pseudo as P
+
+    rng = np.random.default_rng(0)
+    pl = P._blocks(500, rng)
+    assert (pl[:90] == 0.5).all() and set(np.unique(pl[90:])) == {0.2, 0.8}
+    runs = np.diff(np.flatnonzero(np.diff(pl[90:]) != 0))
+    assert runs.min() >= 20 and runs.max() <= 100
+
+
+def test_communication_subspace(default_run):
+    """VISp and MOs share one planted latent; CA1 shares nothing."""
+    r = pd.read_csv(default_run / "rrr.csv")
+    r = r[r.session_id == IBL].set_index(["source", "target"])
+    assert r.loc[("VISp", "MOs"), "full_r2"] > 0.05 and r.loc[("VISp", "MOs"), "optimal_rank"] <= 2
+    assert r.loc[("VISp", "MOs"), "full_r2"] > r.loc[("CA1", "MOs"), "full_r2"] + 0.05
+    assert r.loc[("MOs", "MOs"), "kind"] == "within"
+    assert (default_run / IBL / f"{IBL}_rrr.png").is_file()
