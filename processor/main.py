@@ -1,0 +1,482 @@
+"""
+neuro-decoding: cross-validated decoding of behaviour from population activity.
+
+Reads neuro-align's `aligned` output (and optionally neuro-embedding's `embedding` output) and
+writes, under $OUTPUT_DIR/neuro-decoding/:
+
+  decoding.csv                       one row per session x variable x decoder x region (+ nulls)
+  dropping.csv                       neuron-dropping curves
+  heldout.csv, heldout_<var>.png     held-out-session decoding (>= 2 sessions sharing a variable)
+  <session_id>/<session_id>_decoded_traces.png   decoded vs true (the headline figure)
+  <session_id>/<session_id>_null.png             score vs null, per variable and region
+  <session_id>/<session_id>_dropping.png         neuron-dropping curve
+  <session_id>/summary.json, summary.json, provenance.json
+"""
+from __future__ import annotations
+
+import os
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+from processor.common import Heartbeat, app_version, peak_rss_mb, rel, setup_logging, tool_versions, write_csv, write_json
+
+log = setup_logging("neuro-decoding")
+
+APP = "neuro-decoding"
+DECODERS = ("ridge", "mlp", "bayes", "logistic", "knn")
+DEFAULTS = {
+    "VARIABLES": "auto",
+    "TRIAL_VARIABLES": "auto",
+    "TRIAL_ALIGN": "auto",
+    "TRIAL_WINDOW_S": "-0.1,0.5",
+    "DECODE_BIN_S": "0.1",
+    "SMOOTH_S": "0.2",
+    "CV_FOLDS": "5",
+    "CV_GAP_S": "2.0",
+    "N_SHUFFLES": "200",
+    "MIN_SHIFT_S": "20",
+    "DECODERS": "ridge,mlp,bayes,logistic,knn",
+    "N_POS_BINS": "40",
+    "DROP_REPEATS": "10",
+    "MIN_REGION_NEURONS": "10",
+    "HELDOUT_DIMS": "10",
+    "KNN_K": "25",
+    "TRACE_WINDOW_S": "60",
+    "SEED": "42",
+    "THREADS": "0",
+}
+PARAMETERS = tuple(DEFAULTS)
+CSV_COLUMNS = ["session_id", "subject_id", "condition", "group", "variable", "kind", "unit", "decoder", "features",
+               "region", "n_neurons", "n_samples", "cv", "metric", "score", "score_sd", "r", "median_abs_error",
+               "chance", "null", "null_mean", "null_sd", "null_p95", "p_value", "z", "n_shuffles"]
+BAYES_WINDOW_S = 0.5   # spike counts of the Bayesian decoder are summed over this centred window
+CITATIONS = ["10.1523/ENEURO.0506-19.2020", "10.1038/s41586-023-06031-6"]
+
+
+class ParameterError(ValueError):
+    pass
+
+
+def _list(v: str):
+    v = v.strip()
+    if v.lower() == "auto":
+        return "auto"
+    if v.lower() in ("none", "off", "false"):
+        return []
+    return [x.strip() for x in v.split(",") if x.strip()]
+
+
+def read_parameters(env=os.environ) -> dict:
+    raw = {k: (env.get(k) if env.get(k) not in (None, "") else v) for k, v in DEFAULTS.items()}
+    p: dict = {"VARIABLES": _list(raw["VARIABLES"]), "TRIAL_VARIABLES": _list(raw["TRIAL_VARIABLES"]),
+               "TRIAL_ALIGN": raw["TRIAL_ALIGN"].strip()}
+    dec = [d.strip().lower() for d in raw["DECODERS"].split(",") if d.strip()]
+    bad = [d for d in dec if d not in DECODERS]
+    if bad:
+        raise ParameterError(f"DECODERS must be a subset of {', '.join(DECODERS)}, got {', '.join(bad)}")
+    p["DECODERS"] = sorted(set(dec) | {"ridge"}, key=DECODERS.index)
+    try:
+        for k in ("CV_FOLDS", "N_SHUFFLES", "N_POS_BINS", "DROP_REPEATS", "MIN_REGION_NEURONS", "HELDOUT_DIMS",
+                  "KNN_K", "SEED", "THREADS"):
+            p[k] = int(raw[k])
+        for k in ("DECODE_BIN_S", "SMOOTH_S", "CV_GAP_S", "MIN_SHIFT_S", "TRACE_WINDOW_S"):
+            p[k] = float(raw[k])
+        w = [float(x) for x in raw["TRIAL_WINDOW_S"].split(",")]
+    except ValueError as exc:
+        raise ParameterError(f"bad numeric parameter: {exc}") from exc
+    if len(w) != 2 or w[1] <= w[0]:
+        raise ParameterError("TRIAL_WINDOW_S must be 'start,stop' (s, relative to TRIAL_ALIGN), stop > start")
+    p["TRIAL_WINDOW_S"] = w
+    if p["CV_FOLDS"] < 2 or p["N_SHUFFLES"] < 0 or p["N_POS_BINS"] < 5 or p["DROP_REPEATS"] < 1 \
+            or p["MIN_REGION_NEURONS"] < 2 or p["HELDOUT_DIMS"] < 1 or p["KNN_K"] < 1 or p["THREADS"] < 0:
+        raise ParameterError("CV_FOLDS >= 2, N_SHUFFLES >= 0, N_POS_BINS >= 5, DROP_REPEATS >= 1, "
+                             "MIN_REGION_NEURONS >= 2, HELDOUT_DIMS >= 1, KNN_K >= 1, THREADS >= 0 required")
+    if min(p["DECODE_BIN_S"], p["SMOOTH_S"], p["CV_GAP_S"], p["MIN_SHIFT_S"]) < 0 or p["TRACE_WINDOW_S"] <= 0:
+        raise ParameterError("DECODE_BIN_S, SMOOTH_S, CV_GAP_S, MIN_SHIFT_S must be >= 0 and TRACE_WINDOW_S > 0")
+    return p
+
+
+def features(s, smooth_s: float):
+    """Smoothed activity (Gaussian, sigma SMOOTH_S); sqrt of counts for spiking data."""
+    import numpy as np
+    from scipy.ndimage import gaussian_filter1d
+
+    F = np.sqrt(s.X) if s.is_counts else s.X
+    sig = smooth_s / s.bin_size
+    return gaussian_filter1d(F.astype(np.float64), sig, axis=0, mode="nearest") if sig > 0 else F.astype(np.float64)
+
+
+def find_embeddings(input_dir: Path, A) -> dict:
+    """session_id -> path of neuro-embedding's <session_id>_embeddings.npz (optional `embedding` port)."""
+    import numpy as np
+
+    root = input_dir / "embedding" if (input_dir / "embedding").is_dir() else input_dir
+    out = {}
+    for pth in A.walk(root):
+        if pth.name.endswith("_embeddings.npz"):
+            sid = pth.name[: -len("_embeddings.npz")]
+            try:
+                with np.load(pth, allow_pickle=False) as z:
+                    if "session_id" in z.files:
+                        sid = str(z["session_id"])
+            except Exception:
+                continue
+            out[A.sanitise(sid)] = pth
+    return out
+
+
+def direction_of(y, dt):
+    import numpy as np
+    from scipy.ndimage import gaussian_filter1d
+
+    v = np.gradient(gaussian_filter1d(y, max(1.0, 0.2 / dt)), dt)
+    thr = 0.1 * np.percentile(np.abs(v), 95)
+    return np.where(v > thr, 1, np.where(v < -thr, -1, 0))
+
+
+def run_session(s, p, emb_path, out_dir: Path, A, D, F, hb):
+    import numpy as np
+
+    sid = s.session_id
+    rng = np.random.default_rng(p["SEED"])
+    sheet = {k: s.sheet.get(k) for k in A.SHEET_KEYS}
+    raw = s
+    s = A.rebin(s, p["DECODE_BIN_S"]) if p["DECODE_BIN_S"] > 0 else s
+    dt = s.bin_size
+    rows, drops, figs, nulls, trace_panels = [], [], [], [], []
+    heldout_data = {}
+    res = {"session_id": sid, "n_neurons": int(s.X.shape[1]), "decode_bin_s": dt, "neural_source": s.neural_source,
+           **{k: v for k, v in sheet.items() if v is not None}, "variables": {}}
+    regions = None
+    if s.regions:
+        names, counts = np.unique(np.array(s.regions), return_counts=True)
+        regions = [(r, np.flatnonzero(np.array(s.regions) == r)) for r, c in sorted(zip(names, counts), key=lambda x: -x[1])
+                   if c >= p["MIN_REGION_NEURONS"] and r.lower() not in ("unknown", "root", "void", "")]
+        res["regions"] = {r: int(len(i)) for r, i in regions}
+        if len(regions) < 2 and not (len(regions) == 1 and len(names) > 1):
+            regions = regions if len(names) > 1 else None
+    Fall = features(s, p["SMOOTH_S"])
+    ep = s.epoch_mask
+
+    def row(var, kind, unit, decoder, region, n_neu, n_samp, cv, metric, res_, chance=None, null=None, nst=None,
+            feats="activity"):
+        r = {"session_id": sid, **sheet, "variable": var, "kind": kind, "unit": unit, "decoder": decoder,
+             "features": feats, "region": region, "n_neurons": n_neu, "n_samples": n_samp, "cv": cv, "metric": metric,
+             "score": res_.get("score"), "score_sd": res_.get("score_sd"), "r": res_.get("r"),
+             "median_abs_error": res_.get("median_abs_error"), "chance": chance, "null": null}
+        r.update({k: v for k, v in (nst or {}).items() if k in CSV_COLUMNS})
+        rows.append(r)
+        return r
+
+    # --- continuous variables ---
+    cols, why = A.continuous_variables(s, None if p["VARIABLES"] == "auto" else p["VARIABLES"])
+    if why:
+        res["variables_skipped"] = why
+    emb = None
+    if emb_path is not None:
+        emb = np.load(emb_path, allow_pickle=False)
+    for j in cols:
+        var = s.behavior_names[j]
+        unit = s.unit(var)
+        y_all = s.Y[:, j].astype(np.float64)
+        m = ep & np.isfinite(y_all)
+        idx = np.flatnonzero(m)
+        if idx.size < 50:
+            res["variables"][var] = {"status": "skipped", "reason": f"{idx.size} valid bins"}
+            continue
+        y, Fv, tv = y_all[idx], Fall[idx], s.t[idx]
+        folds = D.blocked_folds(tv, p["CV_FOLDS"], p["CV_GAP_S"])
+        if len(folds) < 2:
+            res["variables"][var] = {"status": "skipped", "reason": "too short for the folds"}
+            continue
+        t0 = time.monotonic()
+        rd = D.ridge_cv(Fv, y, folds)
+        null = D.circular_null(Fv, y, tv, folds, rd["alpha"], p["N_SHUFFLES"], p["MIN_SHIFT_S"], rng) if p["N_SHUFFLES"] else np.array([])
+        nst = D.null_stats(rd["score"], null)
+        cv = f"blocked {len(folds)}-fold, gap {p['CV_GAP_S']:g} s"
+        row(var, "continuous", unit, "ridge", "all", s.X.shape[1], idx.size, cv, "r2", rd, None, "circular shift", nst)
+        vres = {"ridge_r2": rd["score"], "ridge_r": rd["r"], "null_p95": nst["null_p95"], "p_value": nst["p_value"],
+                "z": nst["z"], "median_abs_error": rd["median_abs_error"], "unit": unit}
+        nulls.append({"var": var, "metric": "R²", "chance": None, "items": [{"label": "ridge, all", "score": rd["score"], **nst}]})
+        preds = {"ridge": rd}
+        if "mlp" in p["DECODERS"]:
+            ml = D.mlp_cv(Fv, y, folds, p["SEED"])
+            preds["mlp"] = ml
+            row(var, "continuous", unit, "mlp", "all", s.X.shape[1], idx.size, cv, "r2", ml)
+            vres["mlp_r2"] = ml["score"]
+        if "bayes" in p["DECODERS"] and s.is_counts and A.is_position(var, s.variables.get(var)):
+            k = max(1, int(round(BAYES_WINDOW_S / dt)))
+            Cs = np.apply_along_axis(lambda c: np.convolve(c, np.ones(k), mode="same"), 0, s.X.astype(np.float64))
+            by = D.bayes_cv(Cs[idx], y, folds, p["N_POS_BINS"], dt * k)
+            preds["bayes"] = by
+            row(var, "continuous", unit, "bayes", "all", s.X.shape[1], idx.size, cv, "r2", by)
+            vres["bayes_r2"] = by["score"]
+            vres["bayes_median_abs_error"] = by["median_abs_error"]
+        # kNN on CEBRA embeddings (neuro-embedding output)
+        if emb is not None and "knn" in p["DECODERS"]:
+            et = emb["t"]
+            near = np.clip(np.searchsorted(et, tv), 0, et.size - 1)
+            if "cebra_time" in emb.files:
+                kn = D.knn_cv(emb["cebra_time"][near], y, folds, p["KNN_K"])
+                row(var, "continuous", unit, "knn", "all", s.X.shape[1], idx.size, cv, "r2", kn, feats="cebra_time")
+                vres["knn_cebra_time_r2"] = kn["score"]
+                preds["knn_cebra_time"] = kn
+            if "cebra_behavior" in emb.files and "cebra_behavior_train_mask" in emb.files:
+                trm = emb["cebra_behavior_train_mask"][near]
+                tr, te = np.flatnonzero(trm), np.flatnonzero(~trm)
+                if tr.size > p["KNN_K"] and te.size > 10:
+                    kb = D.knn_cv(emb["cebra_behavior"][near], y, [(tr, te)], p["KNN_K"])
+                    labs = ",".join(str(x) for x in emb["label_names"]) if "label_names" in emb.files else ""
+                    row(var, "continuous", unit, "knn", "all", s.X.shape[1], idx.size,
+                        "train/test split of neuro-embedding (CEBRA-Behavior trained on the train bins)", "r2", kb,
+                        feats=f"cebra_behavior[{labs}]")
+                    vres["knn_cebra_behavior_r2"] = kb["score"]
+        # regions
+        if regions:
+            items = nulls[-1]["items"]
+            for reg, ii in regions:
+                rr = D.ridge_cv(Fv[:, ii], y, folds)
+                nn = D.circular_null(Fv[:, ii], y, tv, folds, rr["alpha"], min(p["N_SHUFFLES"], 100), p["MIN_SHIFT_S"], rng) \
+                    if p["N_SHUFFLES"] else np.array([])
+                ns = D.null_stats(rr["score"], nn)
+                row(var, "continuous", unit, "ridge", reg, int(len(ii)), idx.size, cv, "r2", rr, None, "circular shift", ns)
+                items.append({"label": f"ridge, {reg} ({len(ii)})", "score": rr["score"], **ns})
+                vres.setdefault("regions", {})[reg] = {"r2": rr["score"], "p_value": ns["p_value"], "n_neurons": int(len(ii))}
+        # neuron dropping
+        drops.append({"name": var, "metric": "R²", "rows": D.dropping_curve(Fv, y, folds, "continuous", rd["alpha"],
+                                                                             p["DROP_REPEATS"], rng)})
+        # trace window: start of the middle fold
+        tr_f = folds[len(folds) // 2][1]
+        tt = tv[tr_f]
+        w = tt - tt[0] <= p["TRACE_WINDOW_S"]
+        pl = [("ridge", preds["ridge"]["pred_folds"][len(folds) // 2][w], rd["score"])]
+        best = max((k for k in preds if k != "ridge"), key=lambda k: preds[k]["score"], default=None)
+        if best:
+            pl.append((best.replace("_", " "), preds[best]["pred_folds"][len(folds) // 2][w], preds[best]["score"]))
+        trace_panels.append({"name": var, "unit": unit, "t": tt[w], "true": y[tr_f][w], "preds": pl})
+        decodable = (nst["p_value"] is not None and nst["p_value"] < 0.05) if p["N_SHUFFLES"] else rd["score"] > 0.1
+        if decodable:   # held-out-session decoding only for variables this session decodes
+            heldout_data[var] = (Fv, y, direction_of(y, dt) if A.is_position(var, s.variables.get(var)) else None)
+        vres["seconds"] = round(time.monotonic() - t0, 1)
+        res["variables"][var] = vres
+        hb(f"{sid} {var}: ridge R2 {rd['score']:.3f} (null p95 {nst['null_p95'] if nst['null_p95'] is None else round(nst['null_p95'], 3)}), "
+           f"{vres['seconds']}s", force=True)
+
+    # --- categorical trial variables ---
+    if p["TRIAL_VARIABLES"] != [] and "logistic" in p["DECODERS"]:
+        trials = A.trial_table(A.read_events(raw))
+        if trials is not None and len(trials) >= 2 * p["CV_FOLDS"]:
+            tvars = A.trial_variables(trials, None if p["TRIAL_VARIABLES"] == "auto" else p["TRIAL_VARIABLES"])
+            al = A.align_column(trials, p["TRIAL_ALIGN"])
+            Xt, ok = A.trial_counts(raw, trials, al, tuple(p["TRIAL_WINDOW_S"]))
+            Ft = np.sqrt(Xt) if raw.is_counts else Xt
+            res["trials"] = {"n_trials": int(len(trials)), "align": al, "window_s": p["TRIAL_WINDOW_S"]}
+            for var, lab in tvars.items():
+                keep = ok & np.array([v is not None for v in lab])
+                levels, counts = np.unique(lab[keep].astype(str), return_counts=True)
+                good = levels[counts >= max(5, p["CV_FOLDS"])]
+                keep &= np.isin(lab.astype(str), good)
+                if good.size < 2 or keep.sum() < 4 * p["CV_FOLDS"]:
+                    res["variables"][var] = {"status": "skipped", "reason": f"{good.size} classes with enough trials"}
+                    continue
+                yk = lab[keep].astype(str)
+                Fk = Ft[keep]
+                folds = D.trial_folds(yk.size, p["CV_FOLDS"])
+                if any(np.unique(yk[tr]).size < 2 for tr, _ in folds):
+                    res["variables"][var] = {"status": "skipped", "reason": "a training fold has one class only"}
+                    continue
+                t0 = time.monotonic()
+                lg = D.logistic_cv(Fk, yk, folds, p["SEED"])
+                chance = 1.0 / good.size
+                null = D.shuffle_null(Fk, yk, folds, lg["C"], p["N_SHUFFLES"], rng) if p["N_SHUFFLES"] else np.array([])
+                nst = D.null_stats(lg["score"], null)
+                cv = f"blocked {len(folds)}-fold over trials"
+                row(var, "categorical", "", "logistic", "all", raw.X.shape[1], int(yk.size), cv, "balanced_accuracy", lg,
+                    chance, "trial-label shuffle", nst, feats=f"counts in [{p['TRIAL_WINDOW_S'][0]:g}, {p['TRIAL_WINDOW_S'][1]:g}] s of {al}")
+                vres = {"balanced_accuracy": lg["score"], "chance": chance, "null_p95": nst["null_p95"],
+                        "p_value": nst["p_value"], "z": nst["z"], "classes": good.tolist(), "n_trials": int(yk.size)}
+                items = [{"label": "logistic, all", "score": lg["score"], **nst}]
+                if regions:
+                    for reg, ii in regions:
+                        lr = D.logistic_cv(Fk[:, ii], yk, folds, p["SEED"])
+                        nn = D.shuffle_null(Fk[:, ii], yk, folds, lr["C"], min(p["N_SHUFFLES"], 100), rng) if p["N_SHUFFLES"] else np.array([])
+                        ns = D.null_stats(lr["score"], nn)
+                        row(var, "categorical", "", "logistic", reg, int(len(ii)), int(yk.size), cv, "balanced_accuracy",
+                            lr, chance, "trial-label shuffle", ns, feats=f"counts in window of {al}")
+                        items.append({"label": f"logistic, {reg} ({len(ii)})", "score": lr["score"], **ns})
+                        vres.setdefault("regions", {})[reg] = {"balanced_accuracy": lr["score"], "p_value": ns["p_value"],
+                                                               "n_neurons": int(len(ii))}
+                nulls.append({"var": var, "metric": "balanced accuracy", "chance": chance, "items": items})
+                drops.append({"name": var, "metric": "bal. acc.", "rows": D.dropping_curve(
+                    Fk, yk, folds, "categorical", lg["C"], p["DROP_REPEATS"], rng)})
+                if len([pp for pp in trace_panels if pp.get("categorical")]) < 2:
+                    order = np.argsort(np.concatenate([te for _, te in folds]))
+                    n_show = min(80, yk.size)
+                    trace_panels.append({"name": var, "score": lg["score"], "chance": chance, "categorical": (
+                        np.arange(n_show), lg["true"][order][:n_show], lg["pred"][order][:n_show])})
+                vres["seconds"] = round(time.monotonic() - t0, 1)
+                res["variables"][var] = vres
+                hb(f"{sid} {var}: balanced accuracy {lg['score']:.3f} (chance {chance:.2f}, null p95 "
+                   f"{nst['null_p95'] if nst['null_p95'] is None else round(nst['null_p95'], 3)})", force=True)
+    if emb is not None:
+        emb.close()
+    if not rows:
+        raise ValueError("no variable could be decoded" + (f" (skipped: {why})" if why else ""))
+
+    d = out_dir / sid
+    d.mkdir(parents=True, exist_ok=True)
+    if trace_panels:
+        cont = [x for x in trace_panels if not x.get("categorical")][:4]
+        cat = [x for x in trace_panels if x.get("categorical")][:2]
+        figs.append({"path": F.traces(sid, cont + cat, d / f"{sid}_decoded_traces.png"), "caption": trace_caption(sid, res)})
+    if nulls:
+        groups = [{"title": g["var"], "metric": g["metric"], "chance": g["chance"], "items": g["items"]} for g in nulls]
+        figs.append({"path": F.vs_null(sid, groups, d / f"{sid}_null.png"), "caption": (
+            f"{sid}: decoding score of each variable (dots; blue when p < 0.05) next to its null distribution "
+            "(grey bar: 5-95% of scores after circularly shifting the behaviour in time by at least "
+            f"{p['MIN_SHIFT_S']:g} s, or shuffling trial labels; tick: median). "
+            + ("Further columns decode from one brain region at a time (number of neurons in brackets). " if regions else "")
+            + "A score is meaningful only when it clears its null; the dotted line is chance (0 for R²).")})
+    if drops:
+        figs.append({"path": F.dropping(sid, drops, d / f"{sid}_dropping.png"), "caption": (
+            f"{sid}: neuron-dropping curve, the decoding score with random subsets of neurons (mean ± SD over "
+            f"{p['DROP_REPEATS']} subsets). A curve still rising at the right end means more neurons would decode "
+            "better; a plateau means the information is redundant across neurons.")})
+    res["figures"] = [{"path": f"{sid}/{Path(f['path']).name}", "caption": f["caption"]} for f in figs]
+    return rows, drops, res, heldout_data
+
+
+def trace_caption(sid, res) -> str:
+    parts = []
+    for v, r in res["variables"].items():
+        if "ridge_r2" in r:
+            extra = "".join(f", {k[:-3]} {r[k]:.2f}" for k in ("mlp_r2", "bayes_r2", "knn_cebra_time_r2") if r.get(k) is not None)
+            parts.append(f"{v}: ridge R² {r['ridge_r2']:.2f}{extra} (null 95th percentile "
+                         f"{r['null_p95'] if r['null_p95'] is None else format(r['null_p95'], '.2f')})")
+        elif "balanced_accuracy" in r:
+            parts.append(f"{v}: balanced accuracy {r['balanced_accuracy']:.2f} (chance {r['chance']:.2f})")
+    return (f"{sid}: behaviour decoded from population activity on held-out data (black: true; colours: decoders "
+            "trained on the other, non-overlapping blocks of the session). For trial variables, dots are the "
+            "decoded class per held-out trial, circled when wrong. " + "; ".join(parts) + ".")
+
+
+def main() -> int:
+    started = datetime.now(timezone.utc)
+    t_start = time.monotonic()
+    input_dir, output_dir = os.environ.get("INPUT_DIR"), os.environ.get("OUTPUT_DIR")
+    if not input_dir or not output_dir:
+        log.error("INPUT_DIR and OUTPUT_DIR must be set")
+        return 2
+    input_dir, output_dir = Path(input_dir), Path(output_dir)
+    try:
+        p = read_parameters()
+    except ParameterError as exc:
+        log.error("%s", exc)
+        return 2
+    if not input_dir.is_dir():
+        log.error("INPUT_DIR %s is not a folder", input_dir)
+        return 1
+    os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
+    from processor.resources import resolve_threads, set_thread_env
+
+    threads, thread_src = resolve_threads(p["THREADS"])
+    set_thread_env(threads)
+    from processor import aligned as A
+    from processor import decoders as D
+    from processor import figures as F
+
+    found = A.discover(input_dir, "aligned")
+    for name, reason in found.skipped.items():
+        log.warning("%s: skipped, %s", name, reason)
+    if not found.sessions:
+        log.error("no neuro-align aligned.npz found under %s", input_dir)
+        return 1
+    embs = find_embeddings(input_dir, A)
+    log.info("%d sessions, %d with a neuro-embedding output; decoders %s; %d-fold blocked CV, gap %g s; %d shuffles; "
+             "%d threads (%s)", len(found.sessions), sum(s in embs for s, _ in found.sessions), ",".join(p["DECODERS"]),
+             p["CV_FOLDS"], p["CV_GAP_S"], p["N_SHUFFLES"], threads, thread_src)
+    out = output_dir / APP
+    out.mkdir(parents=True, exist_ok=True)
+    hb = Heartbeat(log, "progress", 30)
+    all_rows, drop_rows, results, statuses, figures_all, warnings = [], [], {}, {}, [], []
+    ho_inputs: dict[str, dict] = {}
+    for sid, path in found.sessions:
+        t0 = time.monotonic()
+        try:
+            s = A.load(sid, path, found.sheet.get(sid))
+            rows, drops, res, ho = run_session(s, p, embs.get(sid), out, A, D, F, hb)
+            all_rows += rows
+            for c in drops:
+                for r in c["rows"]:
+                    drop_rows.append({"session_id": sid, "variable": c["name"], **r})
+            for var, v in ho.items():
+                ho_inputs.setdefault(var, {})[sid] = v
+            write_json(out / sid / "summary.json", {"app": APP, "version": app_version(), **res})
+            results[sid] = res
+            figures_all += res["figures"]
+            statuses[sid] = {"status": "ok", "seconds": round(time.monotonic() - t0, 1)}
+            log.info("%s: %d neurons, %.3g s bins; %s; %.1fs", sid, res["n_neurons"], res["decode_bin_s"],
+                     "; ".join(f"{v} " + (f"R2 {r['ridge_r2']:.2f}" if "ridge_r2" in r else
+                                           f"acc {r['balanced_accuracy']:.2f}" if "balanced_accuracy" in r else r.get("status", ""))
+                               for v, r in res["variables"].items()), time.monotonic() - t0)
+        except Exception as exc:
+            log.exception("%s: failed: %s", sid, exc)
+            statuses[sid] = {"status": "failed", "error": f"{type(exc).__name__}: {exc}", "seconds": round(time.monotonic() - t0, 1)}
+            warnings.append(f"{sid}: failed ({type(exc).__name__}: {exc})")
+    if not results:
+        log.error("every session failed")
+        return 1
+
+    # held-out-session decoding
+    ho_rows, ho_summary = [], {}
+    for var, data in ho_inputs.items():
+        if len(data) < 2:
+            continue
+        try:
+            rr = D.heldout_session(data, p["HELDOUT_DIMS"])
+        except Exception as exc:
+            log.warning("held-out session decoding of %s failed: %s", var, exc)
+            continue
+        for r in rr:
+            ho_rows.append({"variable": var, **{k: (",".join(v) if isinstance(v, list) else v) for k, v in r.items()
+                                                if k not in ("pred", "true")}})
+            all_rows.append({"session_id": r["session_id"], **{k: results[r["session_id"]].get(k) for k in A.SHEET_KEYS},
+                             "variable": var, "kind": "continuous", "decoder": "ridge", "features": f"PCA {r['n_dims']} dims, aligned",
+                             "region": "all", "n_samples": r["n_test"], "metric": "r2", "score": r["aligned"],
+                             "cv": f"held-out session (trained on {', '.join(r['train_sessions'])}; aligned on the first half, tested on the second)"})
+        ho_summary[var] = {r["session_id"]: {"aligned": r["aligned"], "unaligned": r["unaligned"],
+                                             "within_session": r["within_session"]} for r in rr}
+        fn = f"heldout_{A.sanitise(var)}.png"
+        F.heldout(rr, var, out / fn)
+        figures_all.append({"path": fn, "caption": (
+            f"Decoding {var} in a session the decoder never saw. Each session's activity is reduced to "
+            f"{rr[0]['n_dims']} principal components; the other sessions' components are rotated onto a common space "
+            f"(orthogonal Procrustes on {var}-binned averages) and a ridge decoder is trained there. The held-out "
+            "session is rotated using the first half of its own data and decoded on the second half. Compare with its "
+            "own decoder (within session) and with no alignment: an aligned score close to within-session means "
+            "different animals share the same population code.")})
+        log.info("held-out session %s: %s", var, ", ".join(f"{r['session_id']} {r['aligned']:.2f} (within "
+                                                           f"{r['within_session']:.2f}, unaligned {r['unaligned']:.2f})" for r in rr))
+    if ho_rows:
+        write_csv(out / "heldout.csv", ho_rows, ["variable", "session_id", "train_sessions", "reference", "n_dims",
+                                                  "n_conditions_matched", "n_test", "within_session", "aligned", "unaligned"])
+    write_csv(out / "decoding.csv", all_rows, CSV_COLUMNS)
+    write_csv(out / "dropping.csv", drop_rows, ["session_id", "variable", "n_neurons", "mean", "sd", "repeats"])
+    headline = {sid: {k: r.get(k) for k in ("n_neurons", "decode_bin_s", "neural_source", "regions", *A.SHEET_KEYS)
+                      if r.get(k) is not None} | {"variables": r["variables"]} for sid, r in results.items()}
+    write_json(out / "summary.json", {
+        "app": APP, "version": app_version(), "sessions": headline, "heldout_session": ho_summary,
+        "figures": figures_all, "tables": ["decoding.csv", "dropping.csv"] + (["heldout.csv"] if ho_rows else []),
+        "warnings": warnings, "n_ok": len(results), "n_failed": len(statuses) - len(results)})
+    write_json(out / "provenance.json", {
+        "app": APP, "version": app_version(), "variant": "default",
+        "tools": tool_versions(["scikit-learn", "numpy", "scipy", "pandas", "pyarrow", "matplotlib"]),
+        "parameters": p, "inputs": [rel(pth, input_dir) for _, pth in found.sessions] + [rel(x, input_dir) for x in embs.values()],
+        "started": started.isoformat().replace("+00:00", "Z"),
+        "finished": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "wall_seconds": round(time.monotonic() - t_start, 1), "peak_rss_mb": peak_rss_mb(), "gpu": None,
+        "threads": threads, "sessions": statuses, "citations": CITATIONS})
+    log.info("done: %d ok, %d failed, %.1fs, peak RSS %s MB", len(results), len(statuses) - len(results),
+             time.monotonic() - t_start, peak_rss_mb())
+    return 0
