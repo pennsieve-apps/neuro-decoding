@@ -209,7 +209,7 @@ the step fits Lambda's 15 minutes; a large IBL session with every pose variable 
   four (APN +0.29, MRN +0.30, CA1 +0.08, DG +0.11; the window includes the movement). Communication
   subspaces (`rrr.csv`): MRN and APN predict each other's held-out units with R² 0.10-0.13 through
   1-4 dimensions (within region: 0.36 for MRN, 0.17 for APN), and CA1 units at a similar level
-  (0.08-0.13), while the dentate gyrus (16 units) shares almost nothing with the others (R² ≤ 0.02).
+  (0.08-0.13), while the dentate gyrus (16 units) is barely predicted by the others (R² ≤ 0.02).
 - **Synthetic fixture** (tests): the planted structure is recovered: position R² > 0.5 (Bayes >
   0.6, CEBRA-kNN > 0.5) and held-out-session decoding beats no alignment; VISp decodes the stimulus
   side, MOs the choice and wheel, CA1 nothing (p > 0.05); the VISp-MOs shared latent gives a
