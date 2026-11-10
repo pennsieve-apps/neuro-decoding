@@ -9,7 +9,13 @@ autocorrelation of behaviour and activity does not inflate the scores (Glaser et
 """
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
+from sklearn.exceptions import ConvergenceWarning
+
+# lbfgs on label-permuted / pseudo-session labels often stops early on separable folds; harmless
+warnings.filterwarnings("ignore", category=ConvergenceWarning)
 
 ALPHAS = np.logspace(-2, 5, 15)
 CS = (0.001, 0.01, 0.1, 1.0, 10.0)
