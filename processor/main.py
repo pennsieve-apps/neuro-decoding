@@ -30,6 +30,7 @@ DEFAULTS = {
     "TRIAL_VARIABLES": "auto",
     "TRIAL_ALIGN": "auto",
     "TRIAL_WINDOW_S": "-0.1,0.5",
+    "TRIAL_WINDOWS": "auto",
     "DECODE_BIN_S": "0.1",
     "SMOOTH_S": "0.05",
     "HISTORY_BINS": "10",
@@ -55,7 +56,19 @@ CSV_COLUMNS = ["session_id", "subject_id", "condition", "group", "variable", "ki
                "chance", "null", "score_corrected", "null_mean", "null_sd", "null_p95", "p_value", "z", "n_shuffles"]
 RRR_DETREND_S = 60.0   # communication subspaces: running mean removed before the regression
 BAYES_WINDOW_S = 0.5   # spike counts of the Bayesian decoder are summed over this centred window
-CITATIONS = ["10.1523/ENEURO.0506-19.2020", "10.1038/s41586-023-06031-6"]
+CITATIONS = ["10.1523/ENEURO.0506-19.2020", "10.1152/jn.1998.79.2.1017", "10.1038/s41593-019-0555-4",
+             "10.1038/s41586-025-09226-1", "10.1038/s41586-025-09235-0", "10.1016/j.neuron.2019.01.026",
+             "10.1038/s41586-023-06031-6"]
+
+# IBL's per-variable windows (Findling et al. 2025; IBL 2025): (role, name pattern, align candidates, window)
+IBL_WINDOWS = (
+    ("prior", r"probability_?left|block|prior", ("gabor_stimulus_onset_time", "stim_on_time", "stimOn_times",
+                                                  "stimulus_on_time", "go_cue_time", "start_time"), (-0.6, -0.1)),
+    ("choice", r"choice", ("first_movement_time", "firstMovement_times", "wheel_movement_onset_time"), (-0.1, 0.0)),
+    ("feedback", r"feedback|reward|correct", ("feedback_time", "feedback_times", "feedbackTime"), (0.0, 0.2)),
+    ("stimulus", r"side|contrast", ("gabor_stimulus_onset_time", "stim_on_time", "stimOn_times",
+                                    "stimulus_on_time"), (0.0, 0.1)),
+)
 
 
 class ParameterError(ValueError):
@@ -92,6 +105,23 @@ def read_parameters(env=os.environ) -> dict:
     if len(w) != 2 or w[1] <= w[0]:
         raise ParameterError("TRIAL_WINDOW_S must be 'start,stop' (s, relative to TRIAL_ALIGN), stop > start")
     p["TRIAL_WINDOW_S"] = w
+    tw = raw["TRIAL_WINDOWS"].strip()
+    if tw.lower() in ("auto", "off", "none"):
+        p["TRIAL_WINDOWS"] = tw.lower()
+    else:
+        spec = {}
+        for item in tw.split(";"):
+            if not item.strip():
+                continue
+            try:
+                var, rest = item.split("=", 1)
+                col, a, b = rest.rsplit(":", 2)
+                spec[var.strip()] = (col.strip(), float(a), float(b))
+            except ValueError as exc:
+                raise ParameterError(f"TRIAL_WINDOWS: 'auto', 'off' or 'variable=column:start:stop;...', got {item!r}") from exc
+            if spec[var.strip()][2] <= spec[var.strip()][1]:
+                raise ParameterError(f"TRIAL_WINDOWS: stop must be after start in {item!r}")
+        p["TRIAL_WINDOWS"] = spec
     if p["MIN_UNITS_PER_REGION"] < 4 or p["RRR_MAX_RANK"] < 1:
         raise ParameterError("MIN_UNITS_PER_REGION >= 4 and RRR_MAX_RANK >= 1 required")
     if p["HISTORY_BINS"] < 1 or p["HISTORY_BINS"] > 100:
@@ -141,6 +171,57 @@ def direction_of(y, dt):
     v = np.gradient(gaussian_filter1d(y, max(1.0, 0.2 / dt)), dt)
     thr = 0.1 * np.percentile(np.abs(v), 95)
     return np.where(v > thr, 1, np.where(v < -thr, -1, 0))
+
+
+def trial_window(var: str, trials, p: dict, default_align: str):
+    """(align column, (start, stop), role) for a trial variable. TRIAL_WINDOWS=auto uses IBL's
+    windows by role when the trials table has the event column (prior: -0.6 to -0.1 s before the
+    stimulus; stimulus: 0 to 0.1 s after it; choice: -0.1 to 0 s before the first movement;
+    feedback: 0 to 0.2 s after it), else TRIAL_ALIGN + TRIAL_WINDOW_S; 'off' always uses the
+    latter; a mapping 'var=column:start:stop;...' overrides per variable."""
+    import re
+
+    default = (default_align, tuple(p["TRIAL_WINDOW_S"]), "default")
+    tw = p["TRIAL_WINDOWS"]
+    if isinstance(tw, dict):
+        if var in tw:
+            col, a, b = tw[var]
+            if col not in trials.columns:
+                raise ValueError(f"TRIAL_WINDOWS: column {col!r} not in the trials table")
+            return col, (a, b), "TRIAL_WINDOWS"
+        return default
+    if tw == "off":
+        return default
+    for role, pattern, cols, win in IBL_WINDOWS:
+        if re.search(pattern, var, re.I):
+            col = next((c for c in cols if c in trials.columns and trials[c].notna().any()), None)
+            if col:
+                return col, win, role
+            return default
+    return default
+
+
+def drop_duplicate_labels(tvars: dict) -> tuple[dict, dict]:
+    """Trial variables whose labels are a one-to-one relabelling of an earlier one (IBL
+    reward_volume_uL vs is_mouse_rewarded) are dropped: decoding them twice adds nothing."""
+    import numpy as np
+
+    keep, dups = {}, {}
+    for name, lab in tvars.items():
+        twin = None
+        for other, olab in keep.items():
+            m = np.array([a is not None and b is not None for a, b in zip(lab, olab)])
+            if m.sum() < 10 or m.sum() < 0.9 * sum(a is not None for a in lab):
+                continue
+            pairs = set(zip(np.asarray(lab)[m], np.asarray(olab)[m]))
+            if len(pairs) == len({a for a, _ in pairs}) == len({b for _, b in pairs}):
+                twin = other
+                break
+        if twin:
+            dups[name] = twin
+        else:
+            keep[name] = lab
+    return keep, dups
 
 
 def lag_groups(H: int) -> list[list[int]]:
@@ -201,6 +282,15 @@ def run_session(s, p, emb_path, out_dir: Path, A, D, F, hb):
         if len(regions) < 2 and not (len(regions) == 1 and len(names) > 1):
             regions = regions if len(names) > 1 else None
     Fbase = features(s, p["SMOOTH_S"])
+    # the gap between training and test blocks must cover the history window, or the features of
+    # the first test bins overlap the last training bins
+    hist_s = p["HISTORY_BINS"] * s.bin_size
+    gap_s = max(p["CV_GAP_S"], hist_s)
+    if gap_s > p["CV_GAP_S"]:
+        log.warning("%s: CV_GAP_S %.2f s is shorter than the history window (%d bins x %.3g s); using %.2f s",
+                    sid, p["CV_GAP_S"], p["HISTORY_BINS"], s.bin_size, gap_s)
+    gap_bins = int(np.ceil(gap_s / s.bin_size))
+    res["cv_gap_s"] = gap_s
     H = p["HISTORY_BINS"]
     Fall = lagged(Fbase, H)
     n_neu = Fbase.shape[1]
@@ -220,9 +310,11 @@ def run_session(s, p, emb_path, out_dir: Path, A, D, F, hb):
              "median_abs_error": res_.get("median_abs_error"), "chance": chance, "null": null}
         r.update({k: v for k, v in (nst or {}).items() if k in CSV_COLUMNS})
         if r.get("score") is not None and r.get("null_mean") is not None:
-            # IBL's "corrected" score: decoding minus the null mean. For R² a negative null mean (shifted
-            # behaviour predicts worse than its own mean) is not credited: R² minus max(null mean, 0).
-            base = max(r["null_mean"], 0.0) if metric == "r2" else r["null_mean"]
+            # IBL's corrected score (Findling et al. 2025): the score minus the MEDIAN of the null. Our
+            # own addition for R²: a negative null median (shifted behaviour predicts worse than its
+            # mean) is not credited, i.e. R² minus max(null median, 0).
+            med = (nst or {}).get("null_median", r["null_mean"])
+            base = max(med, 0.0) if metric == "r2" else med
             r["score_corrected"] = r["score"] - base
         rows.append(r)
         return r
@@ -244,15 +336,16 @@ def run_session(s, p, emb_path, out_dir: Path, A, D, F, hb):
             res["variables"][var] = {"status": "skipped", "reason": f"{idx.size} valid bins"}
             continue
         y, Fv, tv = y_all[idx], Fall[idx], s.t[idx]
-        folds = D.blocked_folds(tv, p["CV_FOLDS"], p["CV_GAP_S"])
+        folds = D.blocked_folds(tv, p["CV_FOLDS"], gap_s)
         if len(folds) < 2:
             res["variables"][var] = {"status": "skipped", "reason": "too short for the folds"}
             continue
         t0 = time.monotonic()
-        rd = D.ridge_cv(Fv, y, folds)
-        null = D.circular_null(Fv, y, tv, folds, rd["alpha"], p["N_SHUFFLES"], p["MIN_SHIFT_S"], rng) if p["N_SHUFFLES"] else np.array([])
-        nst = D.null_stats(rd["score"], null)
-        cv = f"blocked {len(folds)}-fold, gap {p['CV_GAP_S']:g} s"
+        rd = D.ridge_cv(Fv, y, folds, gap=gap_bins)
+        real_fixed, null = (D.circular_test(Fv, y, tv, folds, rd["alpha"], p["N_SHUFFLES"], p["MIN_SHIFT_S"], rng)
+                            if p["N_SHUFFLES"] else (rd["score"], np.array([])))
+        nst = D.null_stats(real_fixed, null)
+        cv = f"blocked {len(folds)}-fold, gap {gap_s:g} s"
         row(var, "continuous", unit, "ridge", "all", s.X.shape[1], idx.size, cv, "r2", rd, None, "circular shift", nst,
             feats=f"activity, {H} bins of history")
         vres = {"ridge_r2": rd["score"], "ridge_r": rd["r"], "null_p95": nst["null_p95"], "p_value": nst["p_value"],
@@ -296,10 +389,10 @@ def run_session(s, p, emb_path, out_dir: Path, A, D, F, hb):
             items = nulls[-1]["items"]
             for reg, ii in regions:
                 ci = lag_cols(ii)
-                rr = D.ridge_cv(Fv[:, ci], y, folds)
-                nn = D.circular_null(Fv[:, ci], y, tv, folds, rr["alpha"], min(p["N_SHUFFLES"], 100), p["MIN_SHIFT_S"], rng) \
-                    if p["N_SHUFFLES"] else np.array([])
-                ns = D.null_stats(rr["score"], nn)
+                rr = D.ridge_cv(Fv[:, ci], y, folds, gap=gap_bins)
+                rf, nn = (D.circular_test(Fv[:, ci], y, tv, folds, rr["alpha"], min(p["N_SHUFFLES"], 100), p["MIN_SHIFT_S"],
+                                          rng) if p["N_SHUFFLES"] else (rr["score"], np.array([])))
+                ns = D.null_stats(rf, nn)
                 row(var, "continuous", unit, "ridge", reg, int(len(ii)), idx.size, cv, "r2", rr, None, "circular shift", ns,
                     feats=f"activity, {H} bins of history")
                 items.append({"label": f"ridge, {reg} ({len(ii)})", "score": rr["score"], **ns})
@@ -343,14 +436,13 @@ def run_session(s, p, emb_path, out_dir: Path, A, D, F, hb):
         else:
             t0 = time.monotonic()
             ep_idx = np.flatnonzero(ep)
-            # slow drifts (arousal, units lost or found) are removed first, as Semedo et al. used
-            # trial residuals: the activity minus its running mean over RRR_DETREND_S
-            from scipy.ndimage import uniform_filter1d
-
+            # slow drifts (arousal, units lost or found) are removed, as Semedo et al. used trial
+            # residuals: each unit minus its running mean over RRR_DETREND_S, computed within each
+            # fold's training and test segments separately (no smoothing across a fold boundary)
             w = max(1, int(round(RRR_DETREND_S / dt)))
-            Fr = (Fbase - uniform_filter1d(Fbase, w, axis=0, mode="nearest"))[ep_idx]
-            folds_r = D.blocked_folds(s.t[ep_idx], p["CV_FOLDS"], p["CV_GAP_S"])
-            rr_rows = R.communication(Fr, rrr_regions, folds_r, np.random.default_rng(p["SEED"]), p["RRR_MAX_RANK"])
+            folds_r = D.blocked_folds(s.t[ep_idx], p["CV_FOLDS"], gap_s)
+            rr_rows = R.communication(Fbase[ep_idx], rrr_regions, folds_r, np.random.default_rng(p["SEED"]),
+                                      p["RRR_MAX_RANK"], detrend_bins=w)
             for r in rr_rows:
                 r.update(session_id=sid, n_bins=int(ep_idx.size))
             res["rrr_rows"] = rr_rows
@@ -366,13 +458,27 @@ def run_session(s, p, emb_path, out_dir: Path, A, D, F, hb):
         trials = A.trial_table(A.read_events(raw))
         if trials is not None and len(trials) >= 2 * p["CV_FOLDS"]:
             tvars = A.trial_variables(trials, None if p["TRIAL_VARIABLES"] == "auto" else p["TRIAL_VARIABLES"])
+            tvars, dups = drop_duplicate_labels(tvars)
+            for dvar, other in dups.items():
+                res["variables"][dvar] = {"status": "skipped", "reason": f"same trial labels as {other}"}
+                log.info("%s: %s skipped (same trial labels as %s)", sid, dvar, other)
             al = A.align_column(trials, p["TRIAL_ALIGN"])
-            Xt, ok = A.trial_counts(raw, trials, al, tuple(p["TRIAL_WINDOW_S"]))
-            Ft = np.sqrt(Xt) if raw.is_counts else Xt
+            feats_cache: dict = {}
+
+            def trial_features(col, win):
+                if (col, win) not in feats_cache:
+                    Xt, ok_ = A.trial_counts(raw, trials, col, win)
+                    feats_cache[(col, win)] = (np.sqrt(Xt) if raw.is_counts else Xt, ok_)
+                return feats_cache[(col, win)]
+
             pseudo = P.ibl_task(trials, tvars)
-            res["trials"] = {"n_trials": int(len(trials)), "align": al, "window_s": p["TRIAL_WINDOW_S"],
-                             "null": "pseudo-sessions (IBL task model)" if pseudo is not None else "trial-label shuffles"}
+            res["trials"] = {"n_trials": int(len(trials)), "default_align": al, "default_window_s": p["TRIAL_WINDOW_S"],
+                             "null": "pseudo-sessions (IBL task model, action-kernel choices)" if pseudo is not None
+                             else "trial-label shuffles", "windows": {}}
             for var, lab in tvars.items():
+                wcol, win, role = trial_window(var, trials, p, al)
+                res["trials"]["windows"][var] = {"align": wcol, "window_s": list(win), "role": role}
+                Ft, ok = trial_features(wcol, win)
                 keep = ok & np.array([v is not None for v in lab])
                 levels, counts = np.unique(lab[keep].astype(str), return_counts=True)
                 good = levels[counts >= max(5, p["CV_FOLDS"])]
@@ -400,7 +506,7 @@ def run_session(s, p, emb_path, out_dir: Path, A, D, F, hb):
                 nst = D.null_stats(lg["score"], null)
                 cv = f"blocked {len(folds)}-fold over trials"
                 row(var, "categorical", "", "logistic", "all", raw.X.shape[1], int(yk.size), cv, "balanced_accuracy", lg,
-                    chance, null_kind, nst, feats=f"counts in [{p['TRIAL_WINDOW_S'][0]:g}, {p['TRIAL_WINDOW_S'][1]:g}] s of {al}")
+                    chance, null_kind, nst, feats=f"counts in [{win[0]:g}, {win[1]:g}] s of {wcol}")
                 vres = {"balanced_accuracy": lg["score"], "chance": chance, "null": null_kind, "null_p95": nst["null_p95"],
                         "p_value": nst["p_value"], "z": nst["z"], "classes": good.tolist(), "n_trials": int(yk.size)}
                 items = [{"label": "logistic, all", "score": lg["score"], **nst}]
@@ -416,7 +522,7 @@ def run_session(s, p, emb_path, out_dir: Path, A, D, F, hb):
                             nn = D.shuffle_null(Fk[:, ii], yk, folds, lr["C"], n_reg, rng)
                         ns = D.null_stats(lr["score"], nn)
                         row(var, "categorical", "", "logistic", reg, int(len(ii)), int(yk.size), cv, "balanced_accuracy",
-                            lr, chance, null_kind, ns, feats=f"counts in window of {al}")
+                            lr, chance, null_kind, ns, feats=f"counts in [{win[0]:g}, {win[1]:g}] s of {wcol}")
                         items.append({"label": f"logistic, {reg} ({len(ii)})", "score": lr["score"], **ns})
                         vres.setdefault("regions", {})[reg] = {"balanced_accuracy": lr["score"], "p_value": ns["p_value"],
                                                                "n_neurons": int(len(ii))}
@@ -615,7 +721,8 @@ def main() -> int:
                                                   "mean_score", "mean_score_corrected", "fisher_p", "null"])
     if rrr_all:
         write_csv(out / "rrr.csv", rrr_all, ["session_id", "source", "target", "kind", "n_source", "n_target", "n_bins",
-                                            "optimal_rank", "rrr_r2", "full_r2", "within_r2", "within_rank"])
+                                            "optimal_rank", "max_rank", "rank_at_cap", "rrr_r2", "full_r2", "within_r2",
+                                            "within_rank"])
     write_csv(out / "dropping.csv", drop_rows, ["session_id", "variable", "n_neurons", "mean", "sd", "repeats"])
     headline = {sid: {k: r.get(k) for k in ("n_neurons", "decode_bin_s", "neural_source", "regions", *A.SHEET_KEYS)
                       if r.get(k) is not None} | {"variables": r["variables"]} for sid, r in results.items()}

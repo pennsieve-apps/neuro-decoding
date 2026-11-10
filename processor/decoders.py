@@ -42,11 +42,20 @@ def r2(y, p) -> float:
     return float(1 - np.sum((y - p) ** 2) / ss) if ss > 0 else float("nan")
 
 
+def pooled_r2(y_true_folds, y_pred_folds) -> float:
+    """R² over every held-out bin of every fold together (1 - SSE / SST around the mean of all
+    held-out bins). A per-fold R² is measured against that block's own variance, so a block in
+    which the animal barely moves gives a huge negative R² even when its errors are the smallest of
+    the session; pooling avoids that."""
+    return r2(np.concatenate(y_true_folds), np.concatenate(y_pred_folds))
+
+
 def summarize_continuous(y_true_folds, y_pred_folds) -> dict:
+    """score = pooled R² (see pooled_r2); fold_scores and score_sd describe the per-fold R² only."""
     scores = [r2(a, b) for a, b in zip(y_true_folds, y_pred_folds)]
     yt, yp = np.concatenate(y_true_folds), np.concatenate(y_pred_folds)
     r = float(np.corrcoef(yt, yp)[0, 1]) if np.std(yp) > 0 and np.std(yt) > 0 else float("nan")
-    return {"score": float(np.nanmean(scores)), "score_sd": float(np.nanstd(scores)), "r": r,
+    return {"score": pooled_r2(y_true_folds, y_pred_folds), "score_sd": float(np.nanstd(scores)), "r": r,
             "median_abs_error": float(np.median(np.abs(yt - yp))), "fold_scores": scores}
 
 
@@ -86,23 +95,39 @@ def _ridge_preds(dec, y, b, alphas) -> np.ndarray:
     return b @ coefs.T + mu                                               # n_test x alphas
 
 
-def _inner_alpha(a, y, inner: int) -> float:
-    blocks = np.array_split(np.arange(len(y)), inner)
-    scores = np.zeros(len(ALPHAS))
-    for blk in blocks:
-        tr = np.setdiff1d(np.arange(len(y)), blk)
-        P = _ridge_preds(_svd(a[tr]), y[tr], a[blk], ALPHAS)
-        scores += np.array([r2(y[blk], P[:, i]) for i in range(len(ALPHAS))])
+def inner_blocks(n: int, inner: int, gap: int) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Contiguous inner validation blocks over the training rows, with `gap` rows dropped from the
+    inner training set on each side of the block."""
+    out = []
+    for blk in np.array_split(np.arange(n), inner):
+        if blk.size == 0:
+            continue
+        keep = np.ones(n, bool)
+        keep[max(0, blk[0] - gap): blk[-1] + gap + 1] = False
+        tr = np.flatnonzero(keep)
+        if tr.size > 10:
+            out.append((tr, blk))
+    return out
+
+
+def _inner_alpha(a, y, inner: int, gap: int = 0) -> float:
+    """Alpha with the best pooled R² over contiguous inner blocks of the training rows."""
+    P_all, Y_all = [], []
+    for tr, blk in inner_blocks(len(y), inner, gap):
+        P_all.append(_ridge_preds(_svd(a[tr]), y[tr], a[blk], ALPHAS))
+        Y_all.append(y[blk])
+    P, Y = np.vstack(P_all), np.concatenate(Y_all)
+    scores = [r2(Y, P[:, i]) for i in range(len(ALPHAS))]
     return float(ALPHAS[int(np.nanargmax(scores))])
 
 
-def ridge_cv(F: np.ndarray, y: np.ndarray, folds, inner: int = 3) -> dict:
+def ridge_cv(F: np.ndarray, y: np.ndarray, folds, inner: int = 3, gap: int = 0) -> dict:
     """Ridge with alpha chosen per outer fold by inner blocked CV (contiguous blocks of the training
     data); one SVD per fit evaluates every alpha. Returns predictions per fold."""
     preds, trues, alphas = [], [], []
     for tr, te in folds:
         a, b = _standardise(F[tr], F[te])
-        alpha = _inner_alpha(a, y[tr], inner)
+        alpha = _inner_alpha(a, y[tr], inner, gap)
         preds.append(_ridge_preds(_svd(a), y[tr], b, [alpha])[:, 0])
         trues.append(y[te])
         alphas.append(alpha)
@@ -124,11 +149,13 @@ class FastRidge:
             self.mats.append(((a @ V).T, (b @ V) / (lam + alpha)[None, :]))
 
     def score(self, y: np.ndarray) -> float:
-        s = []
+        """Pooled R² over the held-out bins of all folds (as summarize_continuous)."""
+        P, T = [], []
         for (tr, te), (AVt, B) in zip(self.folds, self.mats):
             mu = y[tr].mean()
-            s.append(r2(y[te], B @ (AVt @ (y[tr] - mu)) + mu))
-        return float(np.nanmean(s))
+            P.append(B @ (AVt @ (y[tr] - mu)) + mu)
+            T.append(y[te])
+        return pooled_r2(T, P)
 
 
 def circular_null(F, y, t, folds, alpha, n_shuffles, min_shift_s, rng) -> np.ndarray:
@@ -144,23 +171,65 @@ def circular_null(F, y, t, folds, alpha, n_shuffles, min_shift_s, rng) -> np.nda
     return np.array([fr.score(np.roll(y, int(s))) for s in shifts])
 
 
+def circular_test(F, y, t, folds, alpha, n_shuffles, min_shift_s, rng) -> tuple[float, np.ndarray]:
+    """(R² of the unshifted behaviour, null R²) with the SAME estimator: ridge with the fixed alpha
+    of the real fit on the same folds. The p-value compares like with like; the reported score
+    stays the nested-CV ridge (re-running the inner alpha search for every shift would multiply the
+    cost by the number of shuffles, a shortcut documented in the README)."""
+    real = FastRidge(F, folds, alpha).score(y)
+    return real, circular_null(F, y, t, folds, alpha, n_shuffles, min_shift_s, rng)
+
+
 # --- MLP --------------------------------------------------------------------------------------
 
-def mlp_cv(F, y, folds, seed: int) -> dict:
+MLP_ALPHAS = (0.01, 0.1, 1.0, 10.0)
+
+
+def _mlp_fit(a, z, seed: int, alpha: float, val_frac: float = 0.15, max_epochs: int = 200, patience: int = 10):
+    """MLP (64-32) trained epoch by epoch, early-stopped on the last `val_frac` of the (time-ordered)
+    training rows, a contiguous block, not a random sample of autocorrelated bins. Returns the
+    network at its best validation epoch and that validation R²."""
+    import copy
+    import warnings
+
     from sklearn.neural_network import MLPRegressor
 
-    preds, trues = [], []
+    n = len(z)
+    nv = max(10, int(val_frac * n))
+    tr, va = np.arange(n - nv), np.arange(n - nv, n)
+    m = MLPRegressor(hidden_layer_sizes=(64, 32), alpha=alpha, learning_rate_init=1e-3, random_state=seed,
+                     batch_size=min(256, len(tr)))
+    best, best_m, wait = -np.inf, None, 0
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        for _ in range(max_epochs):
+            m.partial_fit(a[tr], z[tr])
+            sc = r2(z[va], m.predict(a[va]))
+            if sc > best + 1e-4:
+                best, best_m, wait = sc, copy.deepcopy(m), 0
+            else:
+                wait += 1
+                if wait >= patience:
+                    break
+    return best_m or m, best
+
+
+def mlp_cv(F, y, folds, seed: int) -> dict:
+    """Small MLP per outer fold: the L2 penalty is chosen from MLP_ALPHAS by the validation R² of
+    the blocked early-stopping split (the last 15 % of the training rows); predictions are clipped
+    to the training range (a network extrapolates wildly on activity unlike the training blocks)."""
+    preds, trues, alphas = [], [], []
     for tr, te in folds:
         a, b = _standardise(F[tr], F[te])
         mu, sd = y[tr].mean(), y[tr].std() or 1.0
-        m = MLPRegressor(hidden_layer_sizes=(64, 32), alpha=1.0, learning_rate_init=1e-3, max_iter=300,
-                         early_stopping=True, validation_fraction=0.15, n_iter_no_change=15, random_state=seed)
-        m.fit(a, (y[tr] - mu) / sd)
-        # a network extrapolates wildly on activity unlike the training blocks: clip to the training range
+        z = (y[tr] - mu) / sd
+        fits = [(_mlp_fit(a, z, seed, al), al) for al in MLP_ALPHAS]
+        (m, _), al = max(fits, key=lambda f: f[0][1])
         preds.append(np.clip(m.predict(b) * sd + mu, y[tr].min(), y[tr].max()))
         trues.append(y[te])
+        alphas.append(al)
     out = summarize_continuous(trues, preds)
-    out["pred_folds"] = preds
+    out.update(pred_folds=preds, alpha=float(np.median(alphas)))
     return out
 
 

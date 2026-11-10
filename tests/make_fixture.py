@@ -135,7 +135,7 @@ def ibl_session(seed: int, n_trials: int, t_start: float):
         m = (t >= move_on[k]) & (t < move_on[k] + 0.6)
         tau = (t[m] - move_on[k]) / 0.6
         wheel[m] += choice[k] * 4.0 * np.sin(np.pi * tau)
-        s = (t >= stim_on[k] + 0.05) & (t < stim_on[k] + 0.35)
+        s = (t >= stim_on[k] + 0.03) & (t < stim_on[k] + 0.2)   # visual latency ~30 ms (IBL decodes 0-0.1 s)
         stim_drive[s] += side[k] * (0.3 + contrast[k])
         c = (t >= move_on[k] - 0.1) & (t < move_on[k] + 0.6)
         choice_drive[c] += choice[k]

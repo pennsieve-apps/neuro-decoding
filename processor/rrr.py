@@ -9,8 +9,12 @@ For every target region T, its units are split at random into two halves: T_src 
 Each prediction is a ridge regression (full rank; alpha by inner blocked CV), and a reduced-rank
 version of it: the ridge coefficients projected onto the top r principal axes of the ridge
 predictions (the RRR solution with a ridge penalty). The rank is cross-validated with contiguous
-blocks: the optimal rank is the smallest r whose mean R^2 is within one standard error of the
-full model's (Semedo's criterion). R^2 is over all target units (1 - SSE / SST, per fold, averaged).
+blocks: the optimal rank is the smallest r whose mean R^2 is within one SEM (across folds) of the
+peak of the cross-validated RRR curve, Semedo et al.'s rule ("the smallest number of dimensions for
+which predictive performance was within one S.E.M. of the peak performance"). A rank equal to the
+largest tried is flagged (`rank_at_cap`): the true dimensionality may be higher. R^2 is over all
+target units (1 - SSE / SST, per fold, averaged). Slow drifts are removed per contiguous segment of
+each fold (training segments and the test block separately), so no smoothing crosses a fold edge.
 """
 from __future__ import annotations
 
@@ -49,30 +53,49 @@ def _alpha(X, Y, inner=3):
     return best_a
 
 
-def rrr_cv(X, Y, folds, max_rank: int) -> dict:
+def _segments(idx: np.ndarray) -> list[np.ndarray]:
+    cut = np.flatnonzero(np.diff(idx) != 1) + 1
+    return np.split(idx, cut)
+
+
+def detrend(F: np.ndarray, idx: np.ndarray, w: int) -> np.ndarray:
+    """F[idx] minus its running mean over w bins, computed within each contiguous run of idx."""
+    from scipy.ndimage import uniform_filter1d
+
+    out = []
+    for seg in _segments(idx):
+        X = F[seg]
+        out.append(X - uniform_filter1d(X, min(w, len(seg)), axis=0, mode="nearest") if w > 1 else X)
+    return np.vstack(out)
+
+
+def rrr_cv(X, Y, folds, max_rank: int, detrend_bins: int = 0) -> dict:
     """R^2 per rank (1..max_rank) and of the full ridge model, per fold."""
     ranks = np.arange(1, max_rank + 1)
     per_rank = np.zeros((len(folds), ranks.size))
     full = np.zeros(len(folds))
     for f, (tr, te) in enumerate(folds):
-        a, b = _z(X[tr], X[te])
-        ym = Y[tr].mean(axis=0)
-        alpha = _alpha(a, Y[tr])
-        B = _ridge(a, Y[tr] - ym, alpha)
-        full[f] = _r2(Y[te], b @ B + ym)
+        Xtr, Xte = detrend(X, tr, detrend_bins), detrend(X, te, detrend_bins)
+        Ytr, Yte = detrend(Y, tr, detrend_bins), detrend(Y, te, detrend_bins)
+        a, b = _z(Xtr, Xte)
+        ym = Ytr.mean(axis=0)
+        alpha = _alpha(a, Ytr)
+        B = _ridge(a, Ytr - ym, alpha)
+        full[f] = _r2(Yte, b @ B + ym)
         _, _, Vt = np.linalg.svd(a @ B, full_matrices=False)
         for k, r in enumerate(ranks):
             V = Vt[:r].T
-            per_rank[f, k] = _r2(Y[te], b @ (B @ V @ V.T) + ym)
+            per_rank[f, k] = _r2(Yte, b @ (B @ V @ V.T) + ym)
     m = per_rank.mean(axis=0)
-    full_m, full_se = full.mean(), full.std(ddof=1) / np.sqrt(len(folds)) if len(folds) > 1 else 0.0
-    ok = np.flatnonzero(m >= full_m - full_se)
-    opt = int(ranks[ok[0]]) if ok.size else int(ranks[-1])
-    return {"ranks": ranks.tolist(), "r2_by_rank": m.tolist(), "full_r2": float(full_m),
-            "optimal_rank": opt, "rrr_r2": float(m[opt - 1])}
+    peak = int(np.argmax(m))
+    sem = per_rank[:, peak].std(ddof=1) / np.sqrt(len(folds)) if len(folds) > 1 else 0.0
+    opt = int(ranks[np.flatnonzero(m >= m[peak] - sem)[0]])
+    return {"ranks": ranks.tolist(), "r2_by_rank": m.tolist(), "full_r2": float(full.mean()),
+            "optimal_rank": opt, "rrr_r2": float(m[opt - 1]), "peak_rank": int(ranks[peak]),
+            "rank_at_cap": bool(opt == ranks[-1])}
 
 
-def communication(F, regions: dict, folds, rng, max_rank: int = 10) -> list[dict]:
+def communication(F, regions: dict, folds, rng, max_rank: int = 10, detrend_bins: int = 0) -> list[dict]:
     """F: bins x neurons (z-scorable activity); regions: name -> unit column indices."""
     rows = []
     names = list(regions)
@@ -82,20 +105,22 @@ def communication(F, regions: dict, folds, rng, max_rank: int = 10) -> list[dict
         t_src, t_tgt = idx[:half], idx[half:]
         Y = F[:, t_tgt]
         mr = int(min(max_rank, t_tgt.size, half))
-        w = rrr_cv(F[:, t_src], Y, folds, mr)
+        w = rrr_cv(F[:, t_src], Y, folds, mr, detrend_bins)
         rows.append({"source": tgt, "target": tgt, "kind": "within", "n_source": int(half), "n_target": int(t_tgt.size),
                      "optimal_rank": w["optimal_rank"], "rrr_r2": w["rrr_r2"], "full_r2": w["full_r2"],
-                     "r2_by_rank": w["r2_by_rank"]})
+                     "r2_by_rank": w["r2_by_rank"], "rank_at_cap": w["rank_at_cap"], "max_rank": mr})
         for src in names:
             if src == tgt:
                 continue
             s_idx = regions[src]
             if s_idx.size > half:
                 s_idx = rng.choice(s_idx, half, replace=False)
-            b = rrr_cv(F[:, s_idx], Y, folds, int(min(max_rank, t_tgt.size, s_idx.size)))
+            mr_b = int(min(max_rank, t_tgt.size, s_idx.size))
+            b = rrr_cv(F[:, s_idx], Y, folds, mr_b, detrend_bins)
             rows.append({"source": src, "target": tgt, "kind": "between", "n_source": int(s_idx.size),
                          "n_target": int(t_tgt.size), "optimal_rank": b["optimal_rank"], "rrr_r2": b["rrr_r2"],
-                         "full_r2": b["full_r2"], "r2_by_rank": b["r2_by_rank"]})
+                         "full_r2": b["full_r2"], "r2_by_rank": b["r2_by_rank"], "rank_at_cap": b["rank_at_cap"],
+                         "max_rank": mr_b})
     for r in rows:
         w = next(x for x in rows if x["target"] == r["target"] and x["kind"] == "within")
         r["within_r2"] = w["full_r2"]

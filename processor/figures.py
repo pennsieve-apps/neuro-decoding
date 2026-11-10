@@ -165,6 +165,13 @@ def rrr_matrix(sid: str, rows: list[dict], regions: list[str], out: Path) -> Pat
         R2[pos[r["source"]], pos[r["target"]]] = r["full_r2"]
         RK[pos[r["source"]], pos[r["target"]]] = r["optimal_rank"]
     short = [r if len(r) <= 22 else r[:20] + "…" for r in regions]
+    FLAGS = {}
+    for r in rows:   # † rank at the largest tried (dimensionality may be higher); * within-region R² < 0
+        i, j = pos[r["source"]], pos[r["target"]]
+        if r.get("rank_at_cap"):
+            FLAGS[("optimal", i, j)] = "†"
+        if r["kind"] == "within" and r["full_r2"] < 0:
+            FLAGS[("cross-v", i, j)] = "*"
     fig, axes = plt.subplots(1, 2, figsize=(2.2 * n + 5, 1.0 * n + 2.6))
     for ax, M, title, fmt, cmap in ((axes[0], R2, "cross-validated R² (ridge)", "{:.2f}", "Blues"),
                                     (axes[1], RK, "optimal rank (dimensions)", "{:.0f}", "Oranges")):
@@ -176,13 +183,17 @@ def rrr_matrix(sid: str, rows: list[dict], regions: list[str], out: Path) -> Pat
         for i in range(n):
             for j in range(n):
                 if np.isfinite(M[i, j]):
-                    ax.text(j, i, fmt.format(M[i, j]), ha="center", va="center", fontsize=8,
+                    flag = FLAGS.get((title[:7], i, j), "")
+                    ax.text(j, i, fmt.format(M[i, j]) + flag, ha="center", va="center", fontsize=8,
                             color="white" if M[i, j] > 0.6 * vmax else INK, fontweight="bold" if i == j else None)
         ax.set_xlabel("target region (held-out units)")
         ax.set_ylabel("source region")
         ax.set_title(title, fontsize=9)
         fig.colorbar(im, ax=ax, shrink=0.8)
     fig.suptitle(f"{sid}: communication subspaces between regions (diagonal: within region)", fontsize=11)
+    fig.text(0.5, 0.01, "† optimal rank at the largest rank tried (may be higher)    * within-region R² below 0 "
+             "(the region does not predict itself; its between-region values are not interpretable)",
+             ha="center", fontsize=7, color=MUTED)
     fig.tight_layout()
     fig.savefig(out, dpi=DPI)
     plt.close(fig)

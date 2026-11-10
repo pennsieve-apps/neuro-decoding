@@ -11,12 +11,15 @@ from the real neural data with the same pipeline. Here, for a session that has t
 - prior (probability_left, block_type): the first 90 trials unbiased (0.5), then blocks alternating
   0.2 / 0.8 (random start) with lengths from an exponential with mean 60 truncated to 20-100 trials;
 - stimulus side: left with probability probability_left; contrast: resampled from the session;
-- correct / rewarded: with the session's own accuracy at that contrast;
-- choice: the side's correct choice when correct, the other one otherwise.
+- choice: an action-kernel model fitted to the session (as Findling et al. 2025 do per mouse):
+  logit P(right) = b0 + b1 * signed contrast + b2 * sign(signed contrast) + b3 * kernel, where the
+  kernel is an exponentially weighted average of the previous choices (+1 right, -1 left) with a
+  decay chosen by likelihood; pseudo choices are drawn trial by trial from it, so they carry the
+  same dependence on the stimulus and on the mouse's own history as the real ones;
+- correct / rewarded: whether the pseudo choice matches the pseudo stimulus side.
 
-IBL's choice pseudo-sessions use a behavioural model fitted to each mouse (action kernel); the
-accuracy-by-contrast model here is a simplification of that, said in the README. Variables the
-model does not cover use trial-label shuffles.
+Without a choice column the reward follows the session's accuracy per contrast. Variables the model
+does not cover use trial-label shuffles.
 """
 from __future__ import annotations
 
@@ -118,9 +121,56 @@ def ibl_task(trials, tvars: dict) -> dict | None:
         bad = [v for v in lv if v not in good]
         if len(good) == 1 and len(bad) == 1:
             rlabels = {True: good[0], False: bad[0]}
+    cmag = np.abs(contrast)
+    if np.nanmax(cmag) > 1.5:   # IBL percent (0-100) -> fraction
+        cmag = cmag / 100.0
+    kernel = None
+    if cvar is not None:
+        ch = tvars[cvar]
+        r = np.array([1.0 if v == choice_for[right] else 0.0 if v == choice_for[left] else np.nan for v in ch])
+        sc = np.where(side == right, 1.0, np.where(side == left, -1.0, np.nan)) * cmag
+        kernel = fit_action_kernel(sc, r)
     return {"n": len(trials), "side_var": side_var, "left": left, "right": right,
-            "contrasts": contrast[np.isfinite(contrast)], "acc": acc, "choice_var": cvar, "choice_for": choice_for,
-            "reward_var": rvar if rlabels else None, "reward_labels": rlabels, "prior_vars": prior_vars}
+            "contrasts": cmag[np.isfinite(cmag)], "acc": acc, "choice_var": cvar, "choice_for": choice_for,
+            "reward_var": rvar if rlabels else None, "reward_labels": rlabels, "prior_vars": prior_vars,
+            "kernel": kernel, "acc_by_magnitude": {round(float(c), 4): v for c, v in zip(
+                np.unique(cmag[np.isfinite(cmag)]), [acc.get(float(c0), 0.8) for c0 in np.unique(contrast[np.isfinite(contrast)])])}}
+
+
+DECAYS = (0.3, 0.5, 0.7, 0.8, 0.9, 0.95)
+
+
+def _kernel_trace(r: np.ndarray, decay: float) -> np.ndarray:
+    """Before each trial: (1 - decay) * sum_k decay^(k-1) x_{t-k}, x = +1 right / -1 left / 0 none."""
+    x = np.where(np.isfinite(r), 2 * np.nan_to_num(r) - 1, 0.0)
+    k = np.zeros(len(r))
+    acc = 0.0
+    for t in range(len(r)):
+        k[t] = acc
+        acc = decay * acc + (1 - decay) * x[t]
+    return k
+
+
+def _design(sc, kern):
+    return np.column_stack([sc, np.sign(sc), kern])
+
+
+def fit_action_kernel(sc: np.ndarray, r: np.ndarray) -> dict | None:
+    """Logistic choice model with an action kernel; the decay is chosen by log-likelihood."""
+    from sklearn.linear_model import LogisticRegression
+
+    ok = np.isfinite(sc) & np.isfinite(r)
+    if ok.sum() < 40 or len(np.unique(r[ok])) < 2:
+        return None
+    best = None
+    for d in DECAYS:
+        X = _design(sc, _kernel_trace(r, d))[ok]
+        m = LogisticRegression(C=100.0, max_iter=1000).fit(X, r[ok])
+        p = np.clip(m.predict_proba(X)[:, 1], 1e-9, 1 - 1e-9)
+        ll = float(np.sum(r[ok] * np.log(p) + (1 - r[ok]) * np.log(1 - p)))
+        if best is None or ll > best["loglik"]:
+            best = {"decay": d, "coef": m.coef_[0].tolist(), "intercept": float(m.intercept_[0]), "loglik": ll}
+    return best
 
 
 def _blocks(n: int, rng) -> np.ndarray:
@@ -143,13 +193,26 @@ def simulate(task: dict, rng) -> dict:
     is_left = rng.random(n) < pl
     side = np.where(is_left, task["left"], task["right"]).astype(object)
     contrast = rng.choice(task["contrasts"], n) if task["contrasts"].size else np.ones(n)
-    p_ok = np.array([task["acc"].get(float(c), 0.8) for c in contrast])
-    ok = rng.random(n) < p_ok
     out = {task["side_var"]: side}
-    if task["choice_var"]:
+    kern = task.get("kernel")
+    if task["choice_var"] and kern:
+        # choices drawn trial by trial from the fitted action-kernel model
+        sc = np.where(is_left, -1.0, 1.0) * contrast
+        b = np.asarray(kern["coef"])
+        d = kern["decay"]
+        acc = 0.0
+        right_choice = np.zeros(n, bool)
+        for t in range(n):
+            z = kern["intercept"] + b[0] * sc[t] + b[1] * np.sign(sc[t]) + b[2] * acc
+            right_choice[t] = rng.random() < 1.0 / (1.0 + np.exp(-z))
+            acc = d * acc + (1 - d) * (1.0 if right_choice[t] else -1.0)
+        ok = right_choice == ~is_left
         cf = task["choice_for"]
-        other = {task["left"]: task["right"], task["right"]: task["left"]}
-        out[task["choice_var"]] = np.array([cf[s] if k else cf[other[s]] for s, k in zip(side, ok)], dtype=object)
+        out[task["choice_var"]] = np.array([cf[task["right"]] if rc else cf[task["left"]] for rc in right_choice],
+                                           dtype=object)
+    else:
+        p_ok = np.array([task["acc_by_magnitude"].get(round(float(c), 4), 0.8) for c in contrast])
+        ok = rng.random(n) < p_ok
     if task["reward_var"]:
         out[task["reward_var"]] = np.array([task["reward_labels"][bool(k)] for k in ok], dtype=object)
     for name, mp in task["prior_vars"].items():
