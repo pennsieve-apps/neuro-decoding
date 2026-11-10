@@ -1,0 +1,216 @@
+# yaml-language-server: $schema=https://schemas.pennsieve.io/app-manifest/v1.json
+schemaVersion: "1.0"
+application:
+  name: neuro-decoding
+  description: >-
+    Cross-validated decoding of behaviour from population activity (spike-sorted units or calcium
+    ROIs) aligned by neuro-align. Every continuous behaviour variable is decoded with ridge
+    regression, a small neural network (MLP) and, for position, a Bayesian population decoder;
+    trial variables (e.g. IBL choice and stimulus side) with logistic regression. Folds are
+    contiguous blocks of time or trials with a gap, never shuffled bins; each score is compared with
+    a null distribution (behaviour circularly shifted in time; IBL pseudo-sessions or shuffled
+    labels for trial variables), with null-corrected scores and Fisher-combined p-values per region.
+    Also: neuron-dropping curves, decoding per brain region (when units carry one, e.g. IBL),
+    communication subspaces between regions (reduced-rank regression), decoding a
+    held-out session through aligned latent dynamics when several sessions share a variable, and
+    kNN decoding from CEBRA embeddings when neuro-embedding's output is linked. Writes
+    decoding.csv, summary.json and figures (decoded vs true traces, score vs null, neuron-dropping).
+  type: processor
+  tags:
+    - neuroscience
+    - neural-decoding
+    - electrophysiology
+    - calcium-imaging
+    - nwb
+    - population-dynamics
+    - machine-learning
+runtime:
+  # Measured (linux/amd64 under emulation on an M-series Mac, 2 CPUs): see README "Runtime". Peak memory
+  # stays well under 4 GB; wall time on an IBL session exceeds Lambda's 15 minutes, so the timeout is an
+  # hour (a small session with few variables or N_SHUFFLES lowered fits Lambda).
+  cpu: 2048
+  memory: 4096
+  computeTypes:
+    - standard
+  timeoutSeconds: 3600
+parameters:
+  - name: VARIABLES
+    type: string
+    description: >-
+      Continuous behaviour variables to decode, as named in neuro-align's behavior_names
+      (comma-separated); auto: every usable one (wheel_position, a cumulative angle, is left out
+      unless named); none: no continuous variables.
+    defaultValue: auto
+  - name: TRIAL_VARIABLES
+    type: string
+    description: >-
+      Columns of the trials table to decode per trial (comma-separated); auto: every column with 2
+      to 6 distinct values (choice, stimulus side, feedback, block, ...), plus stimulus_side derived
+      from contrast_left/right; none: no trial decoding.
+    defaultValue: auto
+  - name: TRIAL_ALIGN
+    type: string
+    description: Trials table column the trial window is aligned to; auto = stimulus onset when present, else trial start.
+    defaultValue: auto
+  - name: TRIAL_WINDOW_S
+    type: string
+    description: Trial window 'start,stop' (s, relative to TRIAL_ALIGN) for trial variables without an IBL window (see TRIAL_WINDOWS).
+    defaultValue: "-0.1,0.5"
+  - name: TRIAL_WINDOWS
+    type: string
+    description: >-
+      Per-variable trial windows. auto: IBL's windows by role when the trials table has the event
+      (prior: -0.6 to -0.1 s before the stimulus; stimulus side / contrast: 0 to 0.1 s after it;
+      choice: -0.1 to 0 s before the first movement; feedback: 0 to 0.2 s after it), else
+      TRIAL_WINDOW_S around TRIAL_ALIGN. off: TRIAL_WINDOW_S for every variable. Or
+      'variable=column:start:stop;...'.
+    defaultValue: auto
+  - name: DECODE_BIN_S
+    type: number
+    description: Bin size (s) of continuous decoding (neuro-align's bins are summed); 0 keeps neuro-align's bins.
+    defaultValue: 0.1
+    min: 0
+  - name: SMOOTH_S
+    type: number
+    description: SD (s) of the Gaussian smoothing of the activity features (square-root counts) of the continuous decoders.
+    defaultValue: 0.05
+    min: 0
+  - name: HISTORY_BINS
+    type: integer
+    description: >-
+      Bins of history in the ridge and MLP features: the current bin and the HISTORY_BINS - 1
+      before it, grouped on a log scale and averaged per group (lags 0, 1, 2-3, 4-7, 8-...), so
+      10 bins = 1 s at 0.1 s bins = 5 features per neuron.
+    defaultValue: 10
+    min: 1
+    max: 100
+  - name: CV_FOLDS
+    type: integer
+    description: Contiguous cross-validation folds (blocks of time, or of trials).
+    defaultValue: 5
+    min: 2
+  - name: CV_GAP_S
+    type: number
+    description: Seconds of training data dropped on each side of a test block, so neighbouring, autocorrelated bins do not leak.
+    defaultValue: 2.0
+    min: 0
+  - name: N_SHUFFLES
+    type: integer
+    description: >-
+      Null-distribution size: circular shifts of the behaviour (continuous variables), IBL
+      pseudo-sessions (trial variables of IBL-style tasks) or trial-label shuffles (other trial
+      variables); per-region nulls use at most 100. 0 = no nulls.
+    defaultValue: 200
+    min: 0
+  - name: MIN_SHIFT_S
+    type: number
+    description: The circular shifts of the null are at least this long (s) in both directions.
+    defaultValue: 20
+    min: 0
+  - name: DECODERS
+    type: string
+    description: >-
+      Comma-separated subset of ridge (always run), mlp, bayes (position, spiking data), logistic
+      (trial variables), knn (CEBRA embeddings, when the embedding port is linked), rrr
+      (communication subspaces between brain regions).
+    defaultValue: "ridge,mlp,bayes,logistic,knn,rrr"
+  - name: N_POS_BINS
+    type: integer
+    description: Position bins of the Bayesian decoder's tuning curves.
+    defaultValue: 40
+    min: 5
+  - name: DROP_REPEATS
+    type: integer
+    description: Random neuron subsets per size in the neuron-dropping curve.
+    defaultValue: 10
+    min: 1
+  - name: MIN_REGION_NEURONS
+    type: integer
+    description: Brain regions with at least this many neurons are also decoded on their own.
+    defaultValue: 10
+    min: 2
+  - name: MIN_UNITS_PER_REGION
+    type: integer
+    description: Regions with at least this many units enter the communication-subspace (reduced-rank regression) analysis.
+    defaultValue: 10
+    min: 4
+  - name: RRR_MAX_RANK
+    type: integer
+    description: Largest rank tried by the reduced-rank regression between regions.
+    defaultValue: 10
+    min: 1
+  - name: HELDOUT_DIMS
+    type: integer
+    description: PCA dimensions of the aligned latent space of held-out-session decoding.
+    defaultValue: 10
+    min: 1
+  - name: KNN_K
+    type: integer
+    description: Neighbours of the kNN decoder on CEBRA embeddings.
+    defaultValue: 25
+    min: 1
+  - name: TRACE_WINDOW_S
+    type: number
+    description: Length (s) of the decoded-vs-true window in the trace figure.
+    defaultValue: 60
+    min: 1
+  - name: SEED
+    type: integer
+    description: Seed of the shuffles, neuron subsets and the MLP.
+    defaultValue: 42
+  - name: THREADS
+    type: integer
+    description: CPU threads for BLAS; 0 = from the container's CPU quota.
+    defaultValue: 0
+    min: 0
+# Input media types: what the sibling app's output port declares (conventions.md, "Port media types").
+inputs:
+  - name: aligned
+    description: >-
+      neuro-align's aligned output: neuro-align/<session_id>/aligned.npz, events.parquet (trials),
+      manifest.json, one folder per session; found by name anywhere below the port (or INPUT_DIR).
+    mediaTypes:
+      - application/octet-stream
+      - application/vnd.apache.parquet
+      - application/json
+      - text/csv
+      - image/png
+    placement: subfolder
+    required: true
+  - name: embedding
+    description: >-
+      Optional: neuro-embedding's output (neuro-embedding/<session_id>/<session_id>_embeddings.npz);
+      adds kNN decoding from the CEBRA-Time embedding (blocked CV) and the CEBRA-Behavior embedding
+      (on the bins neuro-embedding held out of training).
+    mediaTypes:
+      - application/octet-stream
+      - image/png
+      - text/html
+      - text/csv
+      - application/json
+    placement: subfolder
+    required: false
+outputs:
+  - name: decoding
+    description: >-
+      neuro-decoding/: decoding.csv (session_id, subject_id, condition, group, variable, kind, unit,
+      decoder, features, region, n_neurons, n_samples, cv, metric, score, score_sd, r,
+      median_abs_error, chance, null, score_corrected (score minus the null median), null_mean, null_sd, null_p95, p_value, z,
+      n_shuffles), regions.csv (Fisher-combined per region), rrr.csv (source, target, optimal rank,
+      max rank, rank at cap, cv R², full-model R², within-region R², n units), dropping.csv, heldout.csv and heldout_<variable>.png (two or more sessions), summary.json,
+      provenance.json; <session_id>/<session_id>_decoded_traces.png, _null.png, _dropping.png, _rrr.png,
+      summary.json.
+    mediaTypes:
+      - text/csv
+      - image/png
+      - application/json
+
+# How a release is tested before it is made public: the inputs a review run uses.
+# See app-deploy-service docs/app-manifest-review.md.
+review:
+  version: 1
+  generate:
+    command: python -m tests.make_fixture "$REVIEW_INPUT_DIR" --layout linked --embedding --short
+    root: linked
+  parameters:
+    N_SHUFFLES: 50

@@ -1,0 +1,11 @@
+# Local tests and validation (macOS / Linux): pip install -r requirements-dev.txt
+scikit-learn==1.9.1
+numpy==2.5.4
+scipy==1.18.1
+pandas==3.1.1
+pyarrow==26.0.1
+matplotlib==3.11.2
+pytest==8.4.1
+jsonschema==3.2.0
+PyYAML==6.0.3
+cffconvert==2.0.0
