@@ -68,7 +68,9 @@ def summarize_continuous(y_true_folds, y_pred_folds) -> dict:
 def balanced_accuracy(y, p) -> float:
     from sklearn.metrics import balanced_accuracy_score
 
-    return float(balanced_accuracy_score(y, p))
+    with warnings.catch_warnings():   # a pseudo-session block may hold one class only in a test fold
+        warnings.simplefilter("ignore", UserWarning)
+        return float(balanced_accuracy_score(y, p))
 
 
 # --- ridge ------------------------------------------------------------------------------------
