@@ -54,8 +54,17 @@ parameters:
     defaultValue: auto
   - name: TRIAL_WINDOW_S
     type: string
-    description: Trial window 'start,stop' (s, relative to TRIAL_ALIGN) over which spikes are counted for trial decoding.
+    description: Trial window 'start,stop' (s, relative to TRIAL_ALIGN) for trial variables without an IBL window (see TRIAL_WINDOWS).
     defaultValue: "-0.1,0.5"
+  - name: TRIAL_WINDOWS
+    type: string
+    description: >-
+      Per-variable trial windows. auto: IBL's windows by role when the trials table has the event
+      (prior: -0.6 to -0.1 s before the stimulus; stimulus side / contrast: 0 to 0.1 s after it;
+      choice: -0.1 to 0 s before the first movement; feedback: 0 to 0.2 s after it), else
+      TRIAL_WINDOW_S around TRIAL_ALIGN. off: TRIAL_WINDOW_S for every variable. Or
+      'variable=column:start:stop;...'.
+    defaultValue: auto
   - name: DECODE_BIN_S
     type: number
     description: Bin size (s) of continuous decoding (neuro-align's bins are summed); 0 keeps neuro-align's bins.
@@ -186,9 +195,9 @@ outputs:
     description: >-
       neuro-decoding/: decoding.csv (session_id, subject_id, condition, group, variable, kind, unit,
       decoder, features, region, n_neurons, n_samples, cv, metric, score, score_sd, r,
-      median_abs_error, chance, null, score_corrected, null_mean, null_sd, null_p95, p_value, z,
+      median_abs_error, chance, null, score_corrected (score minus the null median), null_mean, null_sd, null_p95, p_value, z,
       n_shuffles), regions.csv (Fisher-combined per region), rrr.csv (source, target, optimal rank,
-      cv R², full-model R², within-region R², n units), dropping.csv, heldout.csv and heldout_<variable>.png (two or more sessions), summary.json,
+      max rank, rank at cap, cv R², full-model R², within-region R², n units), dropping.csv, heldout.csv and heldout_<variable>.png (two or more sessions), summary.json,
       provenance.json; <session_id>/<session_id>_decoded_traces.png, _null.png, _dropping.png, _rrr.png,
       summary.json.
     mediaTypes:

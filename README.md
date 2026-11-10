@@ -44,23 +44,37 @@ raised-cosine history basis would (10 bins: lag 0, 1, 2-3, 4-7, 8-9, each group 
 features per neuron), z-scored on the training fold
 (SD floored, z clipped at ±10 so that a unit lost or found mid-session cannot blow up a fold);
 `CV_FOLDS` contiguous blocks with `CV_GAP_S` removed from the training set on both sides of each
-test block. Decoders: ridge (alpha from a log grid by inner 3-fold blocked CV; every alpha from one
-eigendecomposition of the Gram matrix), `MLPRegressor` (64-32, L2 penalty 1.0, early stopping,
-predictions clipped to the training range), and for position variables of spiking data a Poisson naive-Bayes decoder
-(occupancy-normalised tuning curves from the training fold, occupancy prior, posterior mean, counts
-in a 0.5 s window). Score: mean of per-fold R² (also Pearson r and median absolute error in the
-variable's unit). Null: `N_SHUFFLES` circular shifts of the behaviour by at least `MIN_SHIFT_S`,
-re-fitting ridge with the alpha of the real fit on the same folds; p = (1 + #null ≥ real) / (1 + N),
-z against the null. Trial variables: spike counts in `TRIAL_WINDOW_S` around `TRIAL_ALIGN`
-(stimulus onset by default), logistic regression (C by inner stratified CV, balanced class
-weights), contiguous trial folds, balanced accuracy. Their null, for a session with the IBL task
-structure (a 0.2 / 0.5 / 0.8 prior and a stimulus side), is IBL's **pseudo-session** null: label
-sequences drawn from the task's generative process (90 unbiased trials, then blocks alternating
-0.2 / 0.8 with lengths from a truncated exponential of mean 60 trials, the stimulus side drawn from
-the block prior, contrasts resampled from the session, correct choices with the session's
-accuracy per contrast), decoded from the real activity with the same pipeline; other sessions use
-trial-label permutations. Every score gets a **null-corrected score** (score minus the null mean;
-for R², minus max(null mean, 0)), and `regions.csv` combines each region's p-values over sessions
+test block (at least the history window: a shorter `CV_GAP_S` is raised to `HISTORY_BINS` ×
+`DECODE_BIN_S`, with a warning). Decoders: ridge (alpha from a log grid by inner 3-fold blocked CV,
+with the same gap around each inner block; every alpha from one eigendecomposition of the Gram
+matrix), `MLPRegressor` (64-32; the L2 penalty chosen from 0.01, 0.1, 1 and 10 by the R² on a
+validation block, the last 15 % of the training rows, which also drives early stopping, so the
+validation data are a contiguous block and not a random sample of autocorrelated bins; predictions
+clipped to the training range), and for position variables of spiking data a Poisson naive-Bayes
+decoder (occupancy-normalised tuning curves from the training fold, occupancy prior, posterior
+mean, counts in a 0.5 s window). **Score: R² pooled over every held-out bin** (1 - SSE / SST over
+all test blocks together; a per-fold R² is measured against that block's own variance, so a block
+in which the animal barely moves would give a huge negative R² even with the smallest errors of the
+session); also Pearson r and median absolute error in the variable's unit, and the SD of the
+per-fold R². Null: `N_SHUFFLES` circular shifts of the behaviour by at least `MIN_SHIFT_S`, the
+same pooled R², with ridge at the alpha of the real fit on the same folds, compared with the
+unshifted behaviour fitted the same way; p = (1 + #null ≥ real) / (1 + N), z against the null.
+(The nulls do not repeat the inner alpha search or the MLP's selection for every shift, which would
+multiply the cost by `N_SHUFFLES`; null and real use the same fixed-parameter estimator, so the
+test is fair, but MLP and Bayes scores have no null of their own.) Trial variables: spike counts in
+a window around a trial event, by default IBL's window for the variable's role (`TRIAL_WINDOWS=auto`,
+below), logistic regression (C by inner stratified CV, balanced class weights), contiguous trial
+folds, balanced accuracy. Their null, for a session with the IBL task structure (a 0.2 / 0.5 / 0.8
+prior and a stimulus side), is IBL's **pseudo-session** null: label sequences drawn from the task's
+generative process (90 unbiased trials, then blocks alternating 0.2 / 0.8 with lengths from a
+truncated exponential of mean 60 trials, the stimulus side drawn from the block prior, contrasts
+resampled from the session) and **choices from an action-kernel model fitted to the session**
+(logistic in signed contrast, its sign and an exponentially weighted average of the previous
+choices, decay chosen by likelihood; Findling et al. 2025 fit such a model per mouse), the reward
+following from choice and side; decoded from the real activity with the same pipeline. Other
+sessions use trial-label permutations. Every score gets a **null-corrected score**: the score
+minus the median of the null (Findling et al. 2025); for R² we credit no negative median (R² minus
+max(null median, 0)), a rule of ours. `regions.csv` combines each region's p-values over sessions
 with Fisher's method. Neuron-dropping:
 random subsets of 1 to N neurons (8 sizes, `DROP_REPEATS` each), fixed alpha / C. Regions: every
 brain region with ≥ `MIN_REGION_NEURONS` neurons decoded alone, with its own null (≤ 100 shuffles).
@@ -86,7 +100,20 @@ Without links everything may sit side by side under `INPUT_DIR`; files are found
    `gabor_stimulus_side`, `mouse_wheel_choice`, `is_mouse_rewarded`, `probability_left`,
    `block_type`, `gabor_stimulus_contrast`; other datasets: `choice`, `feedback_type`, ...), plus
    `stimulus_side` from `contrast_left` / `contrast_right` when present; classes with fewer than 5
-   trials are dropped.
+   trials are dropped, and a variable whose labels are a one-to-one relabelling of an earlier one
+   (IBL `reward_volume_uL` = `is_mouse_rewarded`) is skipped.
+
+   **Trial windows** (`TRIAL_WINDOWS=auto`), IBL's windows (Findling et al. 2025; IBL 2025) when the
+   trials table has the event: prior (`probability_left`, block) in -0.6 to -0.1 s before the
+   stimulus (the inter-trial interval); stimulus side and contrast in 0 to 0.1 s after the stimulus;
+   choice in -0.1 to 0 s before the first wheel movement; feedback / reward in 0 to 0.2 s after the
+   feedback. Other variables, or a session without the event column, use `TRIAL_WINDOW_S` around
+   `TRIAL_ALIGN`; `TRIAL_WINDOWS=off` uses that for everything, and `var=column:start:stop;...`
+   sets windows by hand. How this relates to IBL's analysis: the windows and the pseudo-session
+   null follow IBL; IBL decodes the **Bayes-optimal prior** (a continuous estimate from the past
+   stimuli) with regression, we decode the **block label** with classification; IBL fits the choice
+   model per mouse and runs many sessions and regions with region-level statistics, we fit it per
+   session; and IBL restricts units by its quality metrics, we take neuro-align's units as given.
 2. **Within-session decoding** with blocked CV, the decoders and nulls above, per region too.
 3. **Held-out session** (two or more sessions that each decode a variable significantly): every
    session's features are reduced to `HELDOUT_DIMS` principal components; the other sessions'
@@ -99,17 +126,22 @@ Without links everything may sit side by side under `INPUT_DIR`; files are found
    IBL data CEBRA-kNN does about as well as a linear decoder for the wheel and near chance for the
    choice; [Andre et al. 2026, BrainWideBench](https://doi.org/10.48550/arXiv.2609.22064)): kNN regression (cosine, `KNN_K` neighbours) from
    the CEBRA-Time embedding (label-free, so the same blocked folds apply) and from the CEBRA-Behavior
-   embedding on the bins neuro-embedding held out of its training (its `cebra_behavior_train_mask`;
-   one split, so no leakage of labels into the embedding).
+   embedding on the bins neuro-embedding held out of its training (`cebra_heldout_mask`, after the
+   receptive-field gap; one split, so no leakage of labels into the embedding). CEBRA-Time is trained
+   on neuro-embedding's training bins only, without labels, so using it in every fold leaks no labels.
 5. **Communication subspaces** (units with brain regions, at least two regions with ≥
    `MIN_UNITS_PER_REGION` units; otherwise skipped with the reason logged): each target region's
    units are split at random into halves; the second half is predicted from the first (within
    region) and from each source region subsampled to the same number of units (between regions),
    on the epoch's bins, with the same blocked folds, after removing each unit's 60-s running mean
-   (slow drifts; Semedo et al. used trial residuals). Each prediction is a full-rank ridge model and
-   its reduced-rank versions (ridge coefficients projected on the top r axes of the fitted
-   predictions, r = 1 .. `RRR_MAX_RANK`); the optimal rank is the smallest r within one standard
-   error of the full model (Semedo et al. 2019). Plain numpy.
+   (slow drifts; Semedo et al. used trial residuals), computed within each fold's training
+   segments and test block separately. Each prediction is a full-rank ridge model and its
+   reduced-rank versions (ridge coefficients projected on the top r axes of the fitted predictions,
+   r = 1 .. `RRR_MAX_RANK`); the optimal rank is Semedo et al.'s: the smallest r whose
+   cross-validated R² is within one SEM (across folds) of the peak of the RRR curve. A rank equal to
+   `RRR_MAX_RANK` is flagged (`rank_at_cap`, † in the figure: the dimensionality may be higher), and
+   so is a negative within-region R² (* in the figure: that region does not even predict itself,
+   so its row and column say little). Plain numpy.
 
 ## Parameters
 
@@ -118,7 +150,8 @@ Without links everything may sit side by side under `INPUT_DIR`; files are found
 | `VARIABLES` | `auto` | Continuous variables (neuro-align names, comma-separated), `auto`, or `none`. |
 | `TRIAL_VARIABLES` | `auto` | Trials-table columns to decode per trial, `auto`, or `none`. |
 | `TRIAL_ALIGN` | `auto` | Column the trial window is aligned to (auto: stimulus onset, else trial start). |
-| `TRIAL_WINDOW_S` | `-0.1,0.5` | Window (s) around `TRIAL_ALIGN` whose spikes are counted. |
+| `TRIAL_WINDOW_S` | `-0.1,0.5` | Window (s) around `TRIAL_ALIGN` for variables without an IBL window. |
+| `TRIAL_WINDOWS` | `auto` | Per-variable windows: `auto` (IBL's by role, see Method 1), `off`, or `var=column:start:stop;...`. |
 | `DECODE_BIN_S` | `0.1` | Bin (s) of continuous decoding; 0 keeps neuro-align's bins. |
 | `SMOOTH_S` | `0.05` | Gaussian SD (s) of the feature smoothing. |
 | `HISTORY_BINS` | `10` | Bins of history in the ridge / MLP features (current bin and the 9 before: 1 s at 0.1 s bins). |
@@ -152,12 +185,12 @@ that fails (e.g. no decodable variable) is logged and skipped.
   `n_neurons, n_samples` (bins or trials), `cv` (how it was cross-validated), `metric` (`r2` or
   `balanced_accuracy`), `score, score_sd` (across folds), `r` (Pearson), `median_abs_error`,
   `chance` (1 / classes), `null` (circular shift / pseudo-session / trial-label shuffle),
-  `score_corrected` (score minus the null mean; R²: minus max(null mean, 0)), `null_mean, null_sd,
+  `score_corrected` (score minus the null median; R²: minus max(null median, 0)), `null_mean, null_sd,
   null_p95, p_value, z, n_shuffles`.
 - `regions.csv`: per variable × region × decoder over sessions: `n_sessions, n_neurons, mean_score,
   mean_score_corrected, fisher_p` (Fisher-combined p-value), `null`.
 - `rrr.csv`: `session_id, source, target, kind` (within / between), `n_source, n_target, n_bins,
-  optimal_rank, rrr_r2` (at the optimal rank), `full_r2` (full-rank ridge), `within_r2,
+  optimal_rank, max_rank, rank_at_cap, rrr_r2` (at the optimal rank), `full_r2` (full-rank ridge), `within_r2,
   within_rank` (the target predicted from its own other half); `<session_id>/<session_id>_rrr.png`.
 - `dropping.csv`: `session_id, variable, n_neurons, mean, sd, repeats`.
 - `heldout.csv` (`variable, session_id, train_sessions, reference, n_dims, n_conditions_matched,
@@ -229,9 +262,10 @@ the step fits Lambda's 15 minutes; a large IBL session with every pose variable 
 - R² penalises bias: a decoder that tracks a variable well but is offset on one block can have a
   low or negative R² (see `r` and `median_abs_error`). Region scores depend on how many neurons a
   region has; compare with the neuron-dropping curve.
-- The pseudo-session generator is a simplification of IBL's: choices come from the session's
-  accuracy per contrast, not from a behavioural model fitted to the mouse (action kernel), and
-  variables outside the task model (e.g. reward volume, contrast) use label permutations.
+- The pseudo-session generator follows IBL's but is simpler: the choice model is fitted per
+  session (IBL: per mouse, over sessions), and variables outside the task model (contrast) use
+  label permutations. Without a choice column the reward follows the accuracy per contrast; that
+  null is about as easy to beat as a label shuffle, so its p-values are anti-conservative.
 - Communication-subspace R² between regions is small for spontaneous activity and depends on the
   bin size and on shared slow drifts (behavioural state, movement); a low-rank between-region
   prediction is a statistical description, not proof of a direct connection.

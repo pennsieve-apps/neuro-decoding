@@ -376,7 +376,8 @@ def run_session(s, p, emb_path, out_dir: Path, A, D, F, hb):
                 preds["knn_cebra_time"] = kn
             if "cebra_behavior" in emb.files and "cebra_behavior_train_mask" in emb.files:
                 trm = emb["cebra_behavior_train_mask"][near]
-                tr, te = np.flatnonzero(trm), np.flatnonzero(~trm)
+                hom = emb["cebra_heldout_mask"][near] if "cebra_heldout_mask" in emb.files else ~trm
+                tr, te = np.flatnonzero(trm), np.flatnonzero(hom & ~trm)
                 if tr.size > p["KNN_K"] and te.size > 10:
                     kb = D.knn_cv(emb["cebra_behavior"][near], y, [(tr, te)], p["KNN_K"])
                     labs = ",".join(str(x) for x in emb["label_names"]) if "label_names" in emb.files else ""
