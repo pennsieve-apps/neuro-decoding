@@ -227,16 +227,17 @@ pose variable does not, so `timeoutSeconds` is 3600 on standard compute (`DECODE
 - **Grosmark & Buzsáki, rat Buddy** (58 CA1 units, running epoch): 1-D position decoded with R²
   **0.70** (ridge, 1 s of history; null 95th percentile -0.10, p = 0.005 with 200 circular shifts),
   **0.80** (MLP) and **0.72** (Bayesian decoder; median error **7.9 cm**); kNN on the CEBRA-Behavior
-  embedding (neuro-embedding's held-out bins) 0.50, on CEBRA-Time 0.30. Running speed R² 0.51
+  embedding (neuro-embedding's held-out bins) 0.52, on CEBRA-Time 0.29. Running speed R² 0.51
   (ridge) / 0.56 (MLP); lap direction (out / in) balanced accuracy **0.89** (chance 0.5, null p95
   0.62). The neuron-dropping curve rises steadily (1 unit 0.01, 10 units 0.30, 32 units 0.51, all 58
   units 0.70): position is spread over the population and more units would help. One region only,
-  so no communication subspaces. *Position units:* neuro-align's 1-D `position` spans about 2.5 m
-  although the platform is 1.6 m. This comes from the source file: its 2-D tracking
-  (`position_2d`, x from -0.93 to 1.64 m) extends beyond the stretch the lab linearised
-  (`linearized_position`, 0 to 1.6 m, defined only while the rat ran, 7 % of the samples); where
-  both exist, neuro-align's position equals the lab's plus 0.43 m (slope 1.02, r = 1.00). So the
-  scale is right; the extra length is the track ends outside the lab's linearised stretch.
+  so no communication subspaces. *Position units:* neuro-align (v0.1.1) maps its 1-D `position` onto
+  the frame of the file's `linearized_position` (0 to 1.6 m, defined only while the rat ran, 7 % of
+  the samples) by an affine fit (r = 1.00); `position` still spans about -0.5 to 2.1 m because the
+  file's 2-D tracking (x from -0.93 to 1.64 m) extends beyond the stretch the lab linearised. So
+  the scale is right; the extra length is the track ends outside the lab's linearised stretch.
+  (`position_linearised`, the projection before that mapping, decodes identically: an affine
+  relabelling.)
 - **IBL `sub-NR-0031`** (186 units): wheel velocity R² **0.20** with ridge and **0.34** with the MLP
   (null p95 -0.02); licks 0.39 (MLP 0.64), left / right paw speed 0.42 / 0.44, pupil 0.33, nose tip
   0.29 (all p = 0.005). Trial variables in IBL's windows against IBL pseudo-sessions: **choice**
@@ -249,8 +250,8 @@ pose variable does not, so `timeoutSeconds` is 3600 on standard compute (`DECODE
   `is_mouse_rewarded` and `probability_left`. Per region (corrected): choice in the anterior
   pretectal nucleus +0.20 and midbrain reticular nucleus +0.22 (p = 0.01), not in CA1 or the
   dentate gyrus; reward in APN +0.32, MRN +0.29 and CA1 +0.20; wheel velocity R² 0.13 (APN) and
-  0.08 (MRN). Communication subspaces (`rrr.csv`): APN → MRN R² 0.10 and MRN → APN 0.13 (optimal
-  ranks 1 and 4; within region 0.35 for MRN and 0.17 for APN); predictions of held-out CA1 units
+  0.08 (MRN). Communication subspaces (`rrr.csv`): APN → MRN R² 0.10 and MRN → APN 0.13 (full-rank
+  ridge; 0.09 and 0.12 at the optimal ranks 1 and 4; within region 0.35 for MRN and 0.17 for APN); predictions of held-out CA1 units
   from the two midbrain regions reach 0.07-0.12 although CA1 does not predict its own other half (within-region
   R² -0.11, flagged *); the dentate gyrus (16 units) is barely predicted by the others (R² ≤ 0.01).
   No rank reached the cap.
