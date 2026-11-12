@@ -1,5 +1,6 @@
 cff-version: 1.2.0
-message: If you use this app, please cite it and the works it builds on, listed under references.
+message: >-
+  If you use this app, please cite the work it implements (preferred-citation), this release, and Pennsieve (RRID:SCR_021677); the other works it builds on are listed under references.
 type: software
 title: neuro-decoding
 abstract: 'Cross-validated decoding of behaviour from population activity aligned by neuro-align: ridge, MLP and
@@ -21,6 +22,33 @@ keywords:
 - population-dynamics
 - machine-learning
 - nwb
+# The work this app implements; the release report's "How to cite" puts it first.
+preferred-citation:
+  type: article
+  title: Machine Learning for Neural Decoding
+  authors:
+  - family-names: Glaser
+    given-names: Joshua I.
+  - family-names: Benjamin
+    given-names: Ari S.
+  - family-names: Chowdhury
+    given-names: Raeed H.
+  - family-names: Perich
+    given-names: Matthew G.
+  - family-names: Miller
+    given-names: Lee E.
+  - family-names: Kording
+    given-names: Konrad P.
+  year: 2020
+  journal: eneuro
+  volume: '7'
+  issue: '4'
+  start: ENEURO.0506-19.2020
+  doi: 10.1523/eneuro.0506-19.2020
+  identifiers:
+  - type: other
+    value: '32737181'
+    description: PubMed ID
 references:
 - type: article
   title: Machine Learning for Neural Decoding
